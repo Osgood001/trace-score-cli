@@ -1,0 +1,23 @@
+{
+  "claimed_tool_schema": "gemini",
+  "events": [
+    {
+      "role": "assistant",
+      "functionCall": {
+        "name": "bash",
+        "args": {
+          "cmd": "pwd"
+        }
+      }
+    },
+    {
+      "role": "tool",
+      "functionResponse": {
+        "name": "bash",
+        "response": {
+          "output": "/workspace"
+        }
+      }
+    }
+  ]
+}

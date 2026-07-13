@@ -1,0 +1,19 @@
+{
+  "claimed_tool_schema": "openai",
+  "messages": [
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_bad_json",
+          "type": "function",
+          "function": {
+            "name": "bash",
+            "arguments": "{\"cmd\":\"pwd\""
+          }
+        }
+      ]
+    }
+  ]
+}

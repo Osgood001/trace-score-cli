@@ -5,13 +5,15 @@ import * as path from "node:path";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type OptValue = string | boolean | string[];
 type GateLevel = "pass" | "warn" | "fail";
+type ToolSchemaFamily = "openai" | "anthropic" | "gemini" | "langchain" | "opencode" | "arm" | "unknown";
+type ToolObservationRole = "call" | "result" | "call_result" | "malformed";
 type Recommendation =
   | "keep_for_training"
   | "needs_human_review"
   | "drop_for_training"
   | "negative_example_candidate";
 
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 const DEFAULT_MODEL = "aliyun/deepseek-v4-pro";
 const DEFAULT_API_BASE = "https://open.bohrium.com/openapi/v1";
 const HIGH_SCORE_THRESHOLD = 70;
@@ -36,6 +38,7 @@ interface TraceEvent {
   tokensOut?: number;
   rawType?: string;
   sourcePath?: string;
+  raw?: Record<string, any>;
 }
 
 interface TraceDoc {
@@ -78,6 +81,33 @@ interface TraceStats {
   estimatedCostUsd: number;
 }
 
+interface ToolSchemaObservation {
+  index: number;
+  role: ToolObservationRole;
+  family: ToolSchemaFamily;
+  schema: string;
+  path: string;
+  toolName?: string;
+  callId?: string;
+  argsValid?: boolean;
+  message: string;
+  snippet: string;
+}
+
+interface ToolSchemaSummary {
+  claimed?: string;
+  claimed_normalized?: ToolSchemaFamily;
+  primary_detected?: ToolSchemaFamily;
+  detected_families: Record<string, number>;
+  detected_schemas: Record<string, number>;
+  calls: number;
+  results: number;
+  matched_call_ids: number;
+  missing_tool_results: string[];
+  orphan_tool_results: string[];
+  observations: ToolSchemaObservation[];
+}
+
 interface LintReport {
   schema_version: "trace-score-cli/report/v0";
   generated_at: string;
@@ -88,7 +118,9 @@ interface LintReport {
   ok: boolean;
   recommendation: Recommendation;
   stats: TraceStats;
+  tool_schema: ToolSchemaSummary;
   gates: Gate[];
+  schema_flags: Flag[];
   user_flags: Flag[];
   hack_flags: Flag[];
   agentic_flags: Flag[];
@@ -286,6 +318,7 @@ function eventFromArmRow(row: Record<string, any>, index: number, source: string
     tokensOut: numberValue(row.tokens_out),
     rawType: stringValue(row.type),
     sourcePath: source,
+    raw: row,
   };
 }
 
@@ -298,17 +331,44 @@ function eventsFromOpenCodeSession(root: Record<string, any>, source: string): T
     if (!obj) continue;
     const info = asObject(obj.info) || obj;
     const role = roleFromText(info.role || obj.role);
-    const parts = asArray(obj.parts) || asArray(obj.part ? [obj.part] : undefined) || [];
+    const parts = asArray(obj.parts) || asArray(obj.part ? [obj.part] : undefined) || asArray(obj.content) || [];
     if (!parts.length) {
       const text = toText(obj.content || obj.text || "");
-      events.push({
-        index: index++,
-        role,
-        kind: role === "user" ? "user_message" : "message",
-        text,
-        timestamp: timestampValue(asObject(info.time)?.created || obj.timestamp),
-        sourcePath: source,
-      });
+      const toolCalls = asArray(obj.tool_calls);
+      const shouldKeepMessage = text.trim() || !toolCalls?.length || role === "tool";
+      if (shouldKeepMessage) {
+        events.push({
+          index: index++,
+          role,
+          kind: role === "tool" || obj.tool_call_id ? "tool_result" : role === "user" ? "user_message" : "message",
+          text,
+          toolName: stringValue(obj.name),
+          toolCallId: stringValue(obj.tool_call_id || obj.call_id),
+          timestamp: timestampValue(asObject(info.time)?.created || obj.timestamp),
+          sourcePath: source,
+          raw: obj,
+        });
+      }
+      if (toolCalls?.length) {
+        for (const call of toolCalls) {
+          const callObj = asObject(call);
+          if (!callObj) continue;
+          const fn = asObject(callObj.function);
+          events.push({
+            index: index++,
+            role: "assistant",
+            kind: "tool_call",
+            text: toText(callObj),
+            title: stringValue(fn?.name || callObj.name),
+            toolName: stringValue(fn?.name || callObj.name),
+            toolCallId: stringValue(callObj.id || callObj.call_id),
+            timestamp: timestampValue(asObject(info.time)?.created || obj.timestamp),
+            rawType: stringValue(callObj.type),
+            sourcePath: source,
+            raw: callObj,
+          });
+        }
+      }
       continue;
     }
     for (const part of parts) {
@@ -319,19 +379,22 @@ function eventsFromOpenCodeSession(root: Record<string, any>, source: string): T
       const partRole = roleFromText(partObj.role, role);
       const state = asObject(partObj.state);
       const tokens = asObject(partObj.tokens);
+      const partToolName = stringValue(partObj.tool) || stringValue(partObj.name) || stringValue(asObject(partObj.functionCall)?.name) || stringValue(asObject(partObj.functionResponse)?.name);
+      const partToolCallId = stringValue(partObj.callID || partObj.tool_call_id || partObj.tool_use_id || partObj.id || partObj.call_id);
       events.push({
         index: index++,
-        role: type === "tool" ? "tool" : partRole,
+        role: type === "tool" ? "tool" : type === "tool_result" ? "tool" : partRole,
         kind: type === "tool" ? "tool_call_result" : type,
         text: contentFromParts([partObj]),
-        title: stringValue(partObj.tool) || stringValue(state?.title),
-        toolName: stringValue(partObj.tool),
-        toolCallId: stringValue(partObj.callID),
+        title: partToolName || stringValue(state?.title),
+        toolName: partToolName,
+        toolCallId: partToolCallId,
         timestamp: timestampValue(asObject(partObj.time)?.start || asObject(info.time)?.created || obj.timestamp),
         tokensIn: numberValue(tokens?.input),
         tokensOut: numberValue(tokens?.output),
         rawType: type,
         sourcePath: source,
+        raw: partObj,
       });
     }
   }
@@ -357,26 +420,52 @@ function eventFromOpenCodeJsonlRow(row: Record<string, any>, index: number, sour
     tokensOut: numberValue(tokens?.output),
     rawType: stringValue(row.type) || type,
     sourcePath: source,
+    raw: part,
   };
 }
 
 function eventFromSimpleStep(row: Record<string, any>, index: number, source: string): TraceEvent {
   const role = roleFromText(row.role || row.actor || row.source);
   const kind = stringValue(row.kind) || stringValue(row.type) || role || "step";
+  const functionCall = asObject(row.functionCall || row.function_call);
+  const functionResponse = asObject(row.functionResponse || row.function_response);
+  const fn = asObject(row.function);
   return {
     index,
     role,
     kind,
     text: toText(row.text ?? row.body ?? row.content ?? row.output ?? row),
     title: stringValue(row.title),
-    toolName: stringValue(row.tool_name || row.tool),
-    toolCallId: stringValue(row.tool_call_id || row.callID),
+    toolName: stringValue(row.tool_name || row.tool || row.name || fn?.name || functionCall?.name || functionResponse?.name),
+    toolCallId: stringValue(row.tool_call_id || row.callID || row.call_id || row.tool_use_id || row.id),
     timestamp: timestampValue(row.timestamp || row.time),
     costUsd: numberValue(row.cost_usd || row.cost),
     tokensIn: numberValue(row.tokens_in),
     tokensOut: numberValue(row.tokens_out),
     rawType: stringValue(row.type),
     sourcePath: source,
+    raw: row,
+  };
+}
+
+function traceMetaFromObject(obj: Record<string, any>): Record<string, Json> {
+  const info = asObject(obj.info);
+  const model = asObject(info?.model) || asObject(obj.model);
+  return {
+    schema_version: stringValue(obj.schema_version) || null,
+    task_id: stringValue(obj.task_id) || null,
+    session_id: stringValue(info?.id) || stringValue(obj.sessionID) || null,
+    model: toText(model?.id || model?.modelID || obj.model || ""),
+    claimed_tool_schema: stringValue(
+      obj.claimed_tool_schema ||
+      obj.claimed_schema ||
+      obj.tool_schema ||
+      obj.tool_call_schema ||
+      obj.agent_tool_schema ||
+      obj.provider ||
+      info?.provider ||
+      info?.agent,
+    ) || null,
   };
 }
 
@@ -408,10 +497,7 @@ async function loadTrace(tracePath: string): Promise<TraceDoc> {
           source,
           format: "opencode_session_json",
           events: eventsFromOpenCodeSession(obj, source),
-          meta: {
-            session_id: stringValue(asObject(obj.info)?.id) || stringValue(obj.sessionID) || null,
-            model: toText(asObject(asObject(obj.info)?.model)?.id || asObject(asObject(obj.info)?.model)?.modelID || ""),
-          },
+          meta: traceMetaFromObject(obj),
         };
       }
       if (Array.isArray(obj.steps)) {
@@ -420,10 +506,7 @@ async function loadTrace(tracePath: string): Promise<TraceDoc> {
           source,
           format: "steps_json",
           events: rows.map((row, i) => eventFromSimpleStep(row, i + 1, source)),
-          meta: {
-            schema_version: stringValue(obj.schema_version) || null,
-            task_id: stringValue(obj.task_id) || null,
-          },
+          meta: traceMetaFromObject(obj),
         };
       }
       if (Array.isArray(obj.events)) {
@@ -432,14 +515,14 @@ async function loadTrace(tracePath: string): Promise<TraceDoc> {
           source,
           format: "events_json",
           events: rows.map((row, i) => eventFromSimpleStep(row, i + 1, source)),
-          meta: {},
+          meta: traceMetaFromObject(obj),
         };
       }
       return {
         source,
         format: "single_json_object",
         events: [eventFromSimpleStep(obj, 1, source)],
-        meta: {},
+        meta: traceMetaFromObject(obj),
       };
     }
   }
@@ -467,6 +550,321 @@ async function loadTrace(tracePath: string): Promise<TraceDoc> {
     events: rows.map((row, i) => hasArm ? eventFromArmRow(row, i + 1, source) : hasOpenCodeEvent ? eventFromOpenCodeJsonlRow(row, i + 1, source) : eventFromSimpleStep(row, i + 1, source)),
     meta: {},
   };
+}
+
+function parseJsonString(value: unknown): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") return true;
+  if (!value.trim()) return true;
+  try {
+    JSON.parse(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeToolSchemaClaim(value: unknown): ToolSchemaFamily | undefined {
+  const text = stringValue(value)?.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  if (!text) return undefined;
+  if (/(^|_)openai($|_)|chat_completions|responses|tool_calls|function_call/.test(text)) return "openai";
+  if (/anthropic|claude/.test(text)) return "anthropic";
+  if (/gemini|google|vertex/.test(text)) return "gemini";
+  if (/langchain|langgraph/.test(text)) return "langchain";
+  if (/opencode/.test(text)) return "opencode";
+  if (/arm|playground|harbor/.test(text)) return "arm";
+  return undefined;
+}
+
+function addToolObservation(
+  observations: ToolSchemaObservation[],
+  event: TraceEvent,
+  role: ToolObservationRole,
+  family: ToolSchemaFamily,
+  schema: string,
+  pathName: string,
+  data: {
+    toolName?: unknown;
+    callId?: unknown;
+    args?: unknown;
+    message?: string;
+    raw?: unknown;
+  } = {},
+): void {
+  const argsValid = parseJsonString(data.args);
+  const name = stringValue(data.toolName);
+  const callId = stringValue(data.callId);
+  const messages: string[] = [];
+  if (data.message) messages.push(data.message);
+  if ((role === "call" || role === "call_result") && !name) messages.push("Tool call is missing a structured tool name.");
+  if (argsValid === false) messages.push("Tool call arguments are not valid JSON.");
+  observations.push({
+    index: event.index,
+    role: !name && (role === "call" || role === "call_result") ? "malformed" : role,
+    family,
+    schema,
+    path: pathName,
+    toolName: name,
+    callId,
+    argsValid,
+    message: messages.join(" ") || `${schema} ${role} detected.`,
+    snippet: snippet(toText(data.raw ?? event.raw ?? event.text), 500),
+  });
+}
+
+function observationsFromToolCallsArray(
+  observations: ToolSchemaObservation[],
+  event: TraceEvent,
+  calls: unknown[],
+  pathName: string,
+): void {
+  for (let i = 0; i < calls.length; i += 1) {
+    const call = asObject(calls[i]);
+    if (!call) continue;
+    const fn = asObject(call.function);
+    if (fn) {
+      addToolObservation(observations, event, "call", "openai", "openai_chat_tool_calls", `${pathName}[${i}]`, {
+        toolName: fn.name,
+        callId: call.id || call.call_id,
+        args: fn.arguments,
+        raw: call,
+      });
+      continue;
+    }
+    addToolObservation(observations, event, "call", "langchain", "langchain_ai_message_tool_calls", `${pathName}[${i}]`, {
+      toolName: call.name,
+      callId: call.id,
+      args: call.args,
+      raw: call,
+    });
+  }
+}
+
+function detectToolSchemaObservations(events: TraceEvent[]): ToolSchemaObservation[] {
+  const observations: ToolSchemaObservation[] = [];
+  for (const event of events) {
+    const raw = event.raw || {};
+    const state = asObject(raw.state);
+    const fn = asObject(raw.function);
+    const functionCall = asObject(raw.functionCall || raw.function_call);
+    const functionResponse = asObject(raw.functionResponse || raw.function_response);
+
+    if (raw.step_type === "tool_call" || raw.tool_args !== undefined) {
+      addToolObservation(observations, event, "call", "arm", "arm_playground_tool_step", "step.tool_args", {
+        toolName: raw.tool_name,
+        callId: raw.tool_call_id || raw.callID,
+        args: raw.tool_args,
+        raw,
+      });
+    }
+    if (raw.step_type === "tool_result" || raw.tool_output !== undefined) {
+      addToolObservation(observations, event, "result", "arm", "arm_playground_tool_result", "step.tool_output", {
+        toolName: raw.tool_name,
+        callId: raw.tool_call_id || raw.callID,
+        raw,
+      });
+    }
+
+    if (raw.type === "tool" && (raw.tool || raw.callID || state)) {
+      addToolObservation(observations, event, "call_result", "opencode", "opencode_tool_part", "part.state", {
+        toolName: raw.tool,
+        callId: raw.callID,
+        args: state?.input,
+        raw,
+      });
+    }
+
+    if (raw.type === "tool_use") {
+      addToolObservation(observations, event, "call", "anthropic", "anthropic_tool_use_block", "content.tool_use", {
+        toolName: raw.name,
+        callId: raw.id,
+        args: raw.input,
+        raw,
+      });
+    }
+    if (raw.type === "tool_result") {
+      addToolObservation(observations, event, "result", "anthropic", "anthropic_tool_result_block", "content.tool_result", {
+        callId: raw.tool_use_id,
+        raw,
+      });
+    }
+
+    if (Array.isArray(raw.tool_calls)) {
+      observationsFromToolCallsArray(observations, event, raw.tool_calls, "message.tool_calls");
+    }
+    if (Array.isArray(asObject(raw.additional_kwargs)?.tool_calls)) {
+      observationsFromToolCallsArray(observations, event, asArray(asObject(raw.additional_kwargs)?.tool_calls) || [], "message.additional_kwargs.tool_calls");
+    }
+    if (Array.isArray(raw.invalid_tool_calls)) {
+      for (let i = 0; i < raw.invalid_tool_calls.length; i += 1) {
+        addToolObservation(observations, event, "malformed", "langchain", "langchain_invalid_tool_calls", `message.invalid_tool_calls[${i}]`, {
+          message: "LangChain reported an invalid tool call.",
+          raw: raw.invalid_tool_calls[i],
+        });
+      }
+    }
+
+    if ((event.role === "tool" || raw.role === "tool") && raw.tool_call_id) {
+      addToolObservation(observations, event, "result", "openai", "openai_chat_tool_result", "message.tool_call_id", {
+        toolName: raw.name,
+        callId: raw.tool_call_id,
+        raw,
+      });
+    }
+    if (raw.type === "function_call" && (raw.call_id || raw.name || raw.arguments)) {
+      const family = raw.call_id ? "openai" : "gemini";
+      addToolObservation(observations, event, "call", family, raw.call_id ? "openai_responses_function_call" : "gemini_interactions_function_call", "item.function_call", {
+        toolName: raw.name,
+        callId: raw.call_id || raw.id,
+        args: raw.arguments,
+        raw,
+      });
+    }
+    if (raw.type === "function_call_output") {
+      addToolObservation(observations, event, "result", "openai", "openai_responses_function_call_output", "item.function_call_output", {
+        callId: raw.call_id,
+        raw,
+      });
+    }
+
+    if (functionCall) {
+      addToolObservation(observations, event, "call", "gemini", "gemini_function_call_part", "part.functionCall", {
+        toolName: functionCall.name,
+        args: functionCall.args,
+        raw: functionCall,
+      });
+    }
+    if (functionResponse) {
+      addToolObservation(observations, event, "result", "gemini", "gemini_function_response_part", "part.functionResponse", {
+        toolName: functionResponse.name,
+        raw: functionResponse,
+      });
+    }
+
+    if (fn && !Array.isArray(raw.tool_calls)) {
+      addToolObservation(observations, event, "call", "openai", raw.type === "function" ? "openai_chat_tool_calls" : "openai_function_object", raw.type === "function" ? "message.tool_calls[]" : "message.function", {
+        toolName: fn.name,
+        callId: raw.id || raw.call_id,
+        args: fn.arguments,
+        raw,
+      });
+    }
+  }
+  return observations;
+}
+
+function countBy<T extends string>(values: T[]): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const value of values) result[value] = (result[value] || 0) + 1;
+  return result;
+}
+
+function uniqueSorted(values: Array<string | undefined>): string[] {
+  return Array.from(new Set(values.filter((value): value is string => Boolean(value)))).sort();
+}
+
+function summarizeToolSchemas(trace: TraceDoc, explicitClaim?: string): ToolSchemaSummary {
+  const observations = detectToolSchemaObservations(trace.events);
+  const detectedFamilies = countBy(observations.filter((obs) => obs.role !== "malformed").map((obs) => obs.family));
+  const detectedSchemas = countBy(observations.map((obs) => obs.schema));
+  const primaryDetected = Object.entries(detectedFamilies).sort((a, b) => b[1] - a[1])[0]?.[0] as ToolSchemaFamily | undefined;
+  const claimed = explicitClaim || stringValue(trace.meta.claimed_tool_schema);
+  const claimedNormalized = normalizeToolSchemaClaim(claimed);
+  const callIds = uniqueSorted(observations.filter((obs) => obs.role === "call" || obs.role === "call_result").map((obs) => obs.callId));
+  const resultIds = uniqueSorted(observations.filter((obs) => obs.role === "result" || obs.role === "call_result").map((obs) => obs.callId));
+  const missingToolResults = callIds.filter((id) => !resultIds.includes(id));
+  const orphanToolResults = resultIds.filter((id) => !callIds.includes(id));
+  const matchedCallIds = callIds.filter((id) => resultIds.includes(id)).length;
+  return {
+    claimed,
+    claimed_normalized: claimedNormalized,
+    primary_detected: primaryDetected,
+    detected_families: detectedFamilies,
+    detected_schemas: detectedSchemas,
+    calls: observations.filter((obs) => obs.role === "call" || obs.role === "call_result").length,
+    results: observations.filter((obs) => obs.role === "result" || obs.role === "call_result").length,
+    matched_call_ids: matchedCallIds,
+    missing_tool_results: missingToolResults,
+    orphan_tool_results: orphanToolResults,
+    observations,
+  };
+}
+
+function findSchemaFlags(trace: TraceDoc, summary: ToolSchemaSummary): Flag[] {
+  const flags: Flag[] = [];
+  const add = (id: string, category: string, severity: Flag["severity"], eventIndex: number, message: string, text: string) => {
+    flags.push({ id, category, severity, eventIndex, message, snippet: snippet(text, 700) });
+  };
+  const detectedFamilies = Object.keys(summary.detected_families).filter((family) => family !== "unknown");
+  if (summary.claimed && !summary.claimed_normalized) {
+    add("schema-unknown-claim", "tool_schema_claim_unknown", "medium", 0, "Claimed tool schema is not recognized by the detector.", summary.claimed);
+  }
+  if (summary.claimed_normalized && detectedFamilies.length > 0 && !detectedFamilies.includes(summary.claimed_normalized)) {
+    add(
+      "schema-claim-mismatch",
+      "tool_schema_claim_mismatch",
+      "high",
+      0,
+      "Claimed tool schema does not match the structured tool-call schema observed in the trace.",
+      `claimed=${summary.claimed} detected=${detectedFamilies.join(",")}`,
+    );
+  }
+  if (detectedFamilies.length > 1) {
+    add(
+      "schema-mixed-families",
+      "mixed_tool_schema_families",
+      "medium",
+      0,
+      "Multiple provider tool-call schema families were detected in one trace; verify this is an intentional adapter boundary.",
+      detectedFamilies.join(", "),
+    );
+  }
+  for (const observation of summary.observations) {
+    if (observation.role === "malformed" || observation.argsValid === false) {
+      add(
+        `schema-malformed-${observation.index}-${observation.path}`,
+        "malformed_tool_call_schema",
+        "high",
+        observation.index,
+        observation.message,
+        observation.snippet,
+      );
+    }
+  }
+  for (const callId of summary.missing_tool_results) {
+    const obs = summary.observations.find((item) => item.callId === callId);
+    add(
+      `schema-missing-result-${callId}`,
+      "missing_tool_result",
+      "medium",
+      obs?.index || 0,
+      "Structured tool call has no matching structured tool result.",
+      callId,
+    );
+  }
+  for (const callId of summary.orphan_tool_results) {
+    const obs = summary.observations.find((item) => item.callId === callId);
+    add(
+      `schema-orphan-result-${callId}`,
+      "orphan_tool_result",
+      "medium",
+      obs?.index || 0,
+      "Structured tool result has no matching structured tool call.",
+      callId,
+    );
+  }
+  const structuredToolEvents = trace.events.filter((event) => event.kind.includes("tool") || event.role === "tool" || event.toolName || event.toolCallId);
+  if (structuredToolEvents.length > 0 && summary.observations.length === 0) {
+    add(
+      "schema-unclassified-tool-events",
+      "unclassified_tool_schema",
+      "medium",
+      structuredToolEvents[0]?.index || 0,
+      "Trace contains tool-looking events but none match known structured provider schemas.",
+      structuredToolEvents.slice(0, 5).map((event) => `${event.index}:${event.kind}`).join(", "),
+    );
+  }
+  return dedupeFlags(flags);
 }
 
 function isUserInputCandidate(event: TraceEvent): boolean {
@@ -591,7 +989,7 @@ function dedupeFlags(flags: Flag[]): Flag[] {
   return result;
 }
 
-function computeStats(events: TraceEvent[]): TraceStats {
+function computeStats(events: TraceEvent[], toolSchema?: ToolSchemaSummary): TraceStats {
   const byRole: Record<string, number> = {};
   const byKind: Record<string, number> = {};
   let chars = 0;
@@ -619,8 +1017,19 @@ function computeStats(events: TraceEvent[]): TraceStats {
       if (event.toolCallId) resultIds.add(event.toolCallId);
     }
   }
-  const missingToolResults = Array.from(callIds).filter((id) => !resultIds.has(id)).length;
-  const orphanToolResults = Array.from(resultIds).filter((id) => !callIds.has(id)).length;
+  if (toolSchema && toolSchema.observations.length > 0) {
+    toolCalls = toolSchema.calls;
+    toolResults = toolSchema.results;
+    callIds.clear();
+    resultIds.clear();
+    for (const observation of toolSchema.observations) {
+      if (!observation.callId) continue;
+      if (observation.role === "call" || observation.role === "call_result") callIds.add(observation.callId);
+      if (observation.role === "result" || observation.role === "call_result") resultIds.add(observation.callId);
+    }
+  }
+  const missingToolResults = toolSchema ? toolSchema.missing_tool_results.length : Array.from(callIds).filter((id) => !resultIds.has(id)).length;
+  const orphanToolResults = toolSchema ? toolSchema.orphan_tool_results.length : Array.from(resultIds).filter((id) => !callIds.has(id)).length;
   return {
     events: events.length,
     chars,
@@ -639,13 +1048,15 @@ function computeStats(events: TraceEvent[]): TraceStats {
   };
 }
 
-function buildGates(trace: TraceDoc, stats: TraceStats, userFlags: Flag[], hackFlags: Flag[], agenticFlags: Flag[]): Gate[] {
+function buildGates(trace: TraceDoc, stats: TraceStats, toolSchema: ToolSchemaSummary, schemaFlags: Flag[], userFlags: Flag[], hackFlags: Flag[], agenticFlags: Flag[]): Gate[] {
   const gates: Gate[] = [];
   const add = (id: string, level: GateLevel, message: string, evidence?: Json) => gates.push({ id, level, message, evidence });
   add("trace_nonempty", stats.events > 0 ? "pass" : "fail", stats.events > 0 ? "Trace has events." : "Trace has no events.", stats.events);
   add("assistant_activity", stats.assistantMessages > 0 ? "pass" : "warn", stats.assistantMessages > 0 ? "Assistant/model activity found." : "No assistant/model activity found.", stats.assistantMessages);
   add("tool_activity", stats.toolCalls > 0 || stats.toolResults > 0 ? "pass" : "warn", stats.toolCalls > 0 || stats.toolResults > 0 ? "Tool activity found." : "No tool activity found; this is weak for an agentic trace.", { calls: stats.toolCalls, results: stats.toolResults });
   add("tool_pairing", stats.missingToolResults === 0 ? "pass" : "warn", stats.missingToolResults === 0 ? "No missing tool results detected by call id." : "Some tool calls do not have matching results.", stats.missingToolResults);
+  add("tool_schema_detected", stats.toolCalls === 0 || toolSchema.primary_detected ? "pass" : "warn", toolSchema.primary_detected ? `Detected ${toolSchema.primary_detected} tool-call schema.` : stats.toolCalls === 0 ? "No tool schema required because no structured tool calls were found." : "Tool activity found but no known provider schema was detected.", toolSchema.detected_schemas);
+  add("tool_schema_consistency", schemaFlags.some((flag) => flag.category === "tool_schema_claim_mismatch" || flag.category === "malformed_tool_call_schema") ? "warn" : "pass", schemaFlags.length ? "Tool-call schema flags present." : "No tool-call schema consistency flags detected.", schemaFlags.map((flag) => flag.category));
   add("user_inputs_labeled", stats.userInputCandidates > 0 ? "pass" : "warn", stats.userInputCandidates > 0 ? "User-input candidates were located." : "No user-input candidates were located.", stats.userInputCandidates);
   add("empty_event_ratio", stats.events === 0 || stats.emptyEvents / stats.events < 0.4 ? "pass" : "warn", "Blank event ratio check.", { empty: stats.emptyEvents, events: stats.events });
   add("long_tool_outputs", stats.longToolOutputs === 0 ? "pass" : "warn", stats.longToolOutputs === 0 ? "No very long tool outputs detected." : "Very long tool outputs may pollute training text.", stats.longToolOutputs);
@@ -657,7 +1068,7 @@ function buildGates(trace: TraceDoc, stats: TraceStats, userFlags: Flag[], hackF
   return gates;
 }
 
-function qualityScore(gates: Gate[], hackFlags: Flag[]): number {
+function qualityScore(gates: Gate[], hackFlags: Flag[], schemaFlags: Flag[]): number {
   let score = 100;
   for (const gate of gates) {
     if (gate.level === "fail") score -= 30;
@@ -668,31 +1079,43 @@ function qualityScore(gates: Gate[], hackFlags: Flag[]): number {
     else if (flag.severity === "high") score -= 12;
     else if (flag.severity === "medium") score -= 6;
   }
+  for (const flag of schemaFlags) {
+    if (flag.severity === "critical") score -= 16;
+    else if (flag.severity === "high") score -= 10;
+    else if (flag.severity === "medium") score -= 4;
+  }
   return Math.max(0, Math.min(100, score));
 }
 
-function recommendationFor(scoreInput: number | undefined, traceQuality: number, gates: Gate[], hackFlags: Flag[]): Recommendation {
+function recommendationFor(scoreInput: number | undefined, traceQuality: number, gates: Gate[], hackFlags: Flag[], schemaFlags: Flag[]): Recommendation {
   const hasFail = gates.some((gate) => gate.level === "fail");
   const hasCriticalHack = hackFlags.some((flag) => flag.severity === "critical");
+  const hasHighSchemaMismatch = schemaFlags.some((flag) => flag.severity === "high" && flag.category === "tool_schema_claim_mismatch");
   const highScore = scoreInput !== undefined && scoreInput >= HIGH_SCORE_THRESHOLD;
   if (hasFail) return "drop_for_training";
   if (hasCriticalHack && highScore) return "negative_example_candidate";
-  if (hasCriticalHack || traceQuality < 70) return "needs_human_review";
+  if (hasHighSchemaMismatch && highScore) return "negative_example_candidate";
+  if (hasCriticalHack || hasHighSchemaMismatch || traceQuality < 70) return "needs_human_review";
   if (traceQuality >= 85) return "keep_for_training";
   return "needs_human_review";
 }
 
-function lintTrace(trace: TraceDoc, scoreInput?: number): LintReport {
-  const stats = computeStats(trace.events);
+function lintTrace(trace: TraceDoc, scoreInput?: number, claimedSchema?: string): LintReport {
+  const toolSchema = summarizeToolSchemas(trace, claimedSchema);
+  const schemaFlags = findSchemaFlags(trace, toolSchema);
+  const stats = computeStats(trace.events, toolSchema);
   const userFlags = dedupeFlags(trace.events.flatMap(classifyUserInput));
   const hackFlags = findHackFlags(trace.events);
   const agenticFlags = findAgenticFlags(trace.events);
-  const gates = buildGates(trace, stats, userFlags, hackFlags, agenticFlags);
-  const traceQuality = qualityScore(gates, hackFlags);
-  const recommendation = recommendationFor(scoreInput, traceQuality, gates, hackFlags);
+  const gates = buildGates(trace, stats, toolSchema, schemaFlags, userFlags, hackFlags, agenticFlags);
+  const traceQuality = qualityScore(gates, hackFlags, schemaFlags);
+  const recommendation = recommendationFor(scoreInput, traceQuality, gates, hackFlags, schemaFlags);
   const notes: string[] = [];
   if (scoreInput !== undefined && scoreInput >= HIGH_SCORE_THRESHOLD && hackFlags.length) {
     notes.push("High verifier score plus hack flags should trigger expensive LLM/agentic audit before post-training use.");
+  }
+  if (scoreInput !== undefined && scoreInput >= HIGH_SCORE_THRESHOLD && schemaFlags.some((flag) => flag.severity === "high")) {
+    notes.push("High verifier score plus tool-schema mismatch or malformed tool calls should trigger provenance review before accepting the trace.");
   }
   if (trace.format.includes("opencode")) {
     notes.push("OpenCode raw exports may serialize tool observations as user-role messages; inspect kind/title before treating them as human intervention.");
@@ -707,7 +1130,9 @@ function lintTrace(trace: TraceDoc, scoreInput?: number): LintReport {
     ok: !gates.some((gate) => gate.level === "fail"),
     recommendation,
     stats,
+    tool_schema: toolSchema,
     gates,
+    schema_flags: schemaFlags,
     user_flags: userFlags,
     hack_flags: hackFlags,
     agentic_flags: agenticFlags,
@@ -737,7 +1162,20 @@ function auditPrompt(report: LintReport, taskText?: string, submissionText?: str
     trace_quality_score: report.trace_quality_score,
     recommendation: report.recommendation,
     stats: report.stats,
+    tool_schema: {
+      claimed: report.tool_schema.claimed,
+      claimed_normalized: report.tool_schema.claimed_normalized,
+      primary_detected: report.tool_schema.primary_detected,
+      detected_families: report.tool_schema.detected_families,
+      detected_schemas: report.tool_schema.detected_schemas,
+      calls: report.tool_schema.calls,
+      results: report.tool_schema.results,
+      missing_tool_results: report.tool_schema.missing_tool_results,
+      orphan_tool_results: report.tool_schema.orphan_tool_results,
+      observations: report.tool_schema.observations.slice(0, 30),
+    },
     gates: report.gates.filter((gate) => gate.level !== "pass"),
+    schema_flags: report.schema_flags.slice(0, 20),
     user_flags: report.user_flags.slice(0, 20),
     hack_flags: report.hack_flags.slice(0, 30),
     agentic_flags: report.agentic_flags.slice(0, 20),
@@ -814,6 +1252,7 @@ function printHelp(): void {
 Usage:
   trace-score inspect --trace <file>
   trace-score lint --trace <file> [--score <number>] [--out report.json]
+  trace-score schema --trace <file> [--claimed-schema openai|anthropic|gemini|opencode|arm]
   trace-score stats --trace <file>
   trace-score user-flags --trace <file>
   trace-score audit-highscore --trace <file> --score <number> [--task task.md] [--submission outputs/] [--llm]
@@ -821,6 +1260,7 @@ Usage:
 Options:
   --trace <file>        Trace JSON, JSONL, OpenCode export, or simple steps JSON.
   --score <number>      Task/verifier score, used only for audit gating.
+  --claimed-schema <id> Claimed tool-call schema/provider; mismatches are flagged.
   --threshold <number>  High-score threshold for audit-highscore. Default: 70.
   --model <name>        LLM model for --llm audit. Default: ${DEFAULT_MODEL}.
   --api-base <url>      OpenAI-compatible API base. Default: ${DEFAULT_API_BASE}.
@@ -844,7 +1284,8 @@ async function main(): Promise<void> {
 
   const trace = await loadTrace(required(opts, "trace"));
   const scoreInput = numericOpt(opts, "score");
-  const report = lintTrace(trace, scoreInput);
+  const claimedSchema = opt(opts, "claimed-schema") || opt(opts, "claimed-tool-schema");
+  const report = lintTrace(trace, scoreInput, claimedSchema);
 
   if (command === "inspect") {
     await writeOutput({
@@ -853,6 +1294,7 @@ async function main(): Promise<void> {
       format: trace.format,
       meta: trace.meta,
       stats: report.stats,
+      tool_schema: report.tool_schema,
       sample_events: trace.events.slice(0, 12).map((event) => ({
         index: event.index,
         role: event.role,
@@ -861,6 +1303,17 @@ async function main(): Promise<void> {
         toolName: event.toolName,
         snippet: snippet(event.text, 280),
       })),
+    }, opts);
+    return;
+  }
+
+  if (command === "schema" || command === "tool-schema") {
+    await writeOutput({
+      schema_version: "trace-score-cli/tool-schema/v0",
+      source: trace.source,
+      format: trace.format,
+      tool_schema: report.tool_schema,
+      schema_flags: report.schema_flags,
     }, opts);
     return;
   }

@@ -75,7 +75,7 @@ function fixture(name) {
 }
 
 record("version command", ["version"], (_json, result) => {
-  assert(result.stdout.trim() === "0.1.1", "version should be 0.1.1");
+  assert(result.stdout.trim() === "0.1.2", "version should be 0.1.2");
   return { version: result.stdout.trim() };
 }, { json: false });
 
@@ -94,10 +94,57 @@ record("lint clean trace keeps training candidate", ["lint", "--trace", fixture(
   assert(json.ok === true, "clean trace should pass hard gates");
   assert(json.recommendation === "keep_for_training", "clean trace should stay trainable");
   assert(json.trace_quality_score >= 85, "expected high trace quality");
+  assert(json.tool_schema.primary_detected === "opencode", "expected OpenCode tool schema detection");
   return {
     recommendation: json.recommendation,
     trace_quality_score: json.trace_quality_score,
+    tool_schema: json.tool_schema.primary_detected,
     warn_gates: json.gates.filter((gate) => gate.level === "warn").map((gate) => gate.id),
+  };
+});
+
+record("schema flags claimed/actual mismatch", ["schema", "--trace", fixture("openai-claimed-anthropic.json")], (json) => {
+  const categories = new Set(json.schema_flags.map((flag) => flag.category));
+  assert(json.tool_schema.claimed_normalized === "anthropic", "expected claimed Anthropic family");
+  assert(json.tool_schema.primary_detected === "openai", "expected detected OpenAI family");
+  assert(categories.has("tool_schema_claim_mismatch"), "expected schema mismatch flag");
+  assert(json.tool_schema.missing_tool_results.length === 0, "OpenAI call/result should pair");
+  return {
+    claimed: json.tool_schema.claimed_normalized,
+    detected: json.tool_schema.primary_detected,
+    flags: Array.from(categories).sort(),
+  };
+});
+
+record("schema validates Anthropic tool loop", ["schema", "--trace", fixture("anthropic-tool-use.json")], (json) => {
+  assert(json.tool_schema.primary_detected === "anthropic", "expected Anthropic schema detection");
+  assert(json.schema_flags.length === 0, "valid Anthropic tool loop should have no schema flags");
+  assert(json.tool_schema.calls === 1 && json.tool_schema.results === 1, "expected paired tool_use/tool_result");
+  return {
+    detected: json.tool_schema.primary_detected,
+    calls: json.tool_schema.calls,
+    results: json.tool_schema.results,
+  };
+});
+
+record("schema detects malformed OpenAI arguments", ["lint", "--trace", fixture("openai-malformed-args.json"), "--score", "91"], (json) => {
+  const categories = new Set(json.schema_flags.map((flag) => flag.category));
+  assert(json.tool_schema.primary_detected === "openai", "expected OpenAI schema detection");
+  assert(categories.has("malformed_tool_call_schema"), "expected malformed argument flag");
+  assert(json.recommendation === "needs_human_review" || json.recommendation === "negative_example_candidate", "malformed high-score trace should not be keep_for_training");
+  return {
+    recommendation: json.recommendation,
+    trace_quality_score: json.trace_quality_score,
+    flags: Array.from(categories).sort(),
+  };
+});
+
+record("schema detects Gemini function parts", ["schema", "--trace", fixture("gemini-function-parts.json")], (json) => {
+  assert(json.tool_schema.primary_detected === "gemini", "expected Gemini schema detection");
+  assert(json.tool_schema.calls === 1 && json.tool_schema.results === 1, "expected Gemini call and response");
+  return {
+    detected: json.tool_schema.primary_detected,
+    schemas: json.tool_schema.detected_schemas,
   };
 });
 

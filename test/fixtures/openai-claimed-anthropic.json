@@ -1,0 +1,29 @@
+{
+  "claimed_tool_schema": "anthropic",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Run pwd with the shell tool."
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_openai_1",
+          "type": "function",
+          "function": {
+            "name": "bash",
+            "arguments": "{\"cmd\":\"pwd\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_openai_1",
+      "name": "bash",
+      "content": "/workspace"
+    }
+  ]
+}
