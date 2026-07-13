@@ -75,7 +75,7 @@ function fixture(name) {
 }
 
 record("version command", ["version"], (_json, result) => {
-  assert(result.stdout.trim() === "0.1.3", "version should be 0.1.3");
+  assert(result.stdout.trim() === "0.1.4", "version should be 0.1.4");
   return { version: result.stdout.trim() };
 }, { json: false });
 
@@ -182,6 +182,21 @@ record("tor surfaces unsupported hack write", ["tor", "--trace", fixture("hack-t
     tor: json.tor,
     actions: json.action_count,
     unsupported: json.unsupported_action_count,
+  };
+});
+
+record("structured support scores scientific tool traces", ["structured-support", "--trace", fixture("scientific-structured-tools.json")], (json) => {
+  assert(json.schema_version === "trace-score-cli/structured-support/v0", "expected structured support schema");
+  assert(json.call_count === 1, "expected one structured tool call");
+  assert(json.result_count === 1, "expected one structured tool result");
+  assert(json.pairing_support === 1, "expected call/result pairing");
+  assert(json.query_support === 1, "expected grounded query argument");
+  assert(json.final_answer_support >= 0.5, "expected supported final claims");
+  return {
+    support: json.support,
+    query_support: json.query_support,
+    pairing_support: json.pairing_support,
+    final_answer_support: json.final_answer_support,
   };
 });
 

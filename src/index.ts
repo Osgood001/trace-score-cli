@@ -15,7 +15,7 @@ type Recommendation =
   | "drop_for_training"
   | "negative_example_candidate";
 
-const VERSION = "0.1.3";
+const VERSION = "0.1.4";
 const DEFAULT_MODEL = "aliyun/deepseek-v4-pro";
 const DEFAULT_API_BASE = "https://open.bohrium.com/openapi/v1";
 const HIGH_SCORE_THRESHOLD = 70;
@@ -156,6 +156,71 @@ interface TorReport {
   pairs: TorPair[];
   unsupported_actions: TorOperation[];
   operations: TorOperation[];
+  notes: string[];
+}
+
+interface StructuredToolCall {
+  id: string;
+  event_index: number;
+  tool_name?: string;
+  arguments_text: string;
+  argument_terms: string[];
+  grounded: boolean;
+  grounding_terms: string[];
+  snippet: string;
+}
+
+interface StructuredToolResult {
+  id: string;
+  event_index: number;
+  tool_name?: string;
+  chars: number;
+  evidence_terms: string[];
+  snippet: string;
+}
+
+interface StructuredToolPair {
+  call_id: string;
+  result_id: string;
+  call_event_index: number;
+  result_event_index: number;
+  tool_name?: string;
+  match_type: "call_id" | "fifo";
+}
+
+interface StructuredClaimSupport {
+  id: string;
+  event_index: number;
+  text: string;
+  claim_terms: string[];
+  evidence_terms: string[];
+  prompt_terms: string[];
+  supported: boolean;
+  matched_result_ids: string[];
+}
+
+interface StructuredSupportReport {
+  schema_version: "trace-score-cli/structured-support/v0";
+  generated_at: string;
+  source: string;
+  format: string;
+  support: number | null;
+  call_count: number;
+  result_count: number;
+  paired_call_count: number;
+  grounded_call_count: number;
+  final_claim_count: number;
+  supported_final_claim_count: number;
+  tool_counts: Record<string, number>;
+  query_support: number | null;
+  pairing_support: number | null;
+  final_answer_support: number | null;
+  long_result_count: number;
+  pairs: StructuredToolPair[];
+  unpaired_calls: StructuredToolCall[];
+  orphan_results: StructuredToolResult[];
+  unsupported_final_claims: StructuredClaimSupport[];
+  sample_supported_claims: StructuredClaimSupport[];
   notes: string[];
 }
 
@@ -476,8 +541,17 @@ function eventFromOpenCodeJsonlRow(row: Record<string, any>, index: number, sour
 }
 
 function eventFromSimpleStep(row: Record<string, any>, index: number, source: string): TraceEvent {
-  const role = roleFromText(row.role || row.actor || row.source);
+  const rawType = stringValue(row.type);
+  const metadata = asObject(row.metadata);
+  const parsedContent = typeof row.content === "string" ? asObject(safeJsonParse(row.content)) : undefined;
+  let role = roleFromText(row.role || row.actor || row.source);
   const kind = stringValue(row.kind) || stringValue(row.type) || role || "step";
+  if (role === "unknown") {
+    if (kind === "reasoning" || kind === "final_answer") role = "assistant";
+    else if (kind === "tool_call") role = "assistant";
+    else if (kind === "tool_result") role = "tool";
+    else if (kind === "round_start") role = "environment";
+  }
   const functionCall = asObject(row.functionCall || row.function_call);
   const functionResponse = asObject(row.functionResponse || row.function_response);
   const fn = asObject(row.function);
@@ -487,13 +561,13 @@ function eventFromSimpleStep(row: Record<string, any>, index: number, source: st
     kind,
     text: toText(row.text ?? row.body ?? row.content ?? row.output ?? row),
     title: stringValue(row.title),
-    toolName: stringValue(row.tool_name || row.tool || row.name || fn?.name || functionCall?.name || functionResponse?.name),
+    toolName: stringValue(row.tool_name || row.tool || row.name || metadata?.tool_name || parsedContent?.name || fn?.name || functionCall?.name || functionResponse?.name),
     toolCallId: stringValue(row.tool_call_id || row.callID || row.call_id || row.tool_use_id || row.id),
     timestamp: timestampValue(row.timestamp || row.time),
     costUsd: numberValue(row.cost_usd || row.cost),
     tokensIn: numberValue(row.tokens_in),
     tokensOut: numberValue(row.tokens_out),
-    rawType: stringValue(row.type),
+    rawType,
     sourcePath: source,
     raw: row,
   };
@@ -507,6 +581,8 @@ function traceMetaFromObject(obj: Record<string, any>): Record<string, Json> {
     task_id: stringValue(obj.task_id) || null,
     session_id: stringValue(info?.id) || stringValue(obj.sessionID) || null,
     model: toText(model?.id || model?.modelID || obj.model || ""),
+    prompt: stringValue(obj.prompt) || null,
+    prompt_slug: stringValue(obj.prompt_slug) || null,
     claimed_tool_schema: stringValue(
       obj.claimed_tool_schema ||
       obj.claimed_schema ||
@@ -615,6 +691,14 @@ function parseJsonString(value: unknown): boolean | undefined {
   }
 }
 
+function safeJsonParse(value: string): unknown | undefined {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeToolSchemaClaim(value: unknown): ToolSchemaFamily | undefined {
   const text = stringValue(value)?.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
   if (!text) return undefined;
@@ -696,6 +780,8 @@ function detectToolSchemaObservations(events: TraceEvent[]): ToolSchemaObservati
   for (const event of events) {
     const raw = event.raw || {};
     const state = asObject(raw.state);
+    const metadata = asObject(raw.metadata);
+    const parsedContent = typeof raw.content === "string" ? asObject(safeJsonParse(raw.content)) : asObject(raw.content);
     const fn = asObject(raw.function);
     const functionCall = asObject(raw.functionCall || raw.function_call);
     const functionResponse = asObject(raw.functionResponse || raw.function_response);
@@ -712,6 +798,21 @@ function detectToolSchemaObservations(events: TraceEvent[]): ToolSchemaObservati
       addToolObservation(observations, event, "result", "arm", "arm_playground_tool_result", "step.tool_output", {
         toolName: raw.tool_name,
         callId: raw.tool_call_id || raw.callID,
+        raw,
+      });
+    }
+    if (raw.type === "tool_call") {
+      addToolObservation(observations, event, "call", "arm", "plain_structured_tool_call_event", "event.content", {
+        toolName: raw.tool_name || metadata?.tool_name || parsedContent?.name || event.toolName,
+        callId: raw.tool_call_id || raw.callID || raw.id,
+        args: parsedContent?.arguments || parsedContent?.input || raw.arguments || raw.input,
+        raw: parsedContent || raw,
+      });
+    }
+    if (raw.type === "tool_result" && !raw.tool_use_id && !raw.tool_call_id) {
+      addToolObservation(observations, event, "result", "arm", "plain_structured_tool_result_event", "event.content", {
+        toolName: raw.tool_name || metadata?.tool_name || event.toolName,
+        callId: raw.callID || raw.id,
         raw,
       });
     }
@@ -733,7 +834,7 @@ function detectToolSchemaObservations(events: TraceEvent[]): ToolSchemaObservati
         raw,
       });
     }
-    if (raw.type === "tool_result") {
+    if (raw.type === "tool_result" && raw.tool_use_id) {
       addToolObservation(observations, event, "result", "anthropic", "anthropic_tool_result_block", "content.tool_result", {
         callId: raw.tool_use_id,
         raw,
@@ -1727,6 +1828,240 @@ function torTrace(trace: TraceDoc): TorReport {
   };
 }
 
+const STRUCTURED_STOPWORDS = new Set([
+  "the", "and", "for", "with", "that", "this", "from", "into", "onto", "your", "have", "has", "had", "are", "was", "were",
+  "will", "would", "should", "could", "can", "may", "might", "must", "not", "but", "about", "above", "below", "than",
+  "then", "there", "their", "these", "those", "when", "where", "what", "which", "while", "also", "such", "been", "being",
+  "because", "therefore", "however", "patient", "patients", "information", "section", "sections", "result", "results",
+  "content", "meta", "limit", "skip", "total", "name", "arguments", "drug_name", "tool", "call", "round", "answer",
+]);
+
+function primitiveValuesText(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map(primitiveValuesText).filter(Boolean).join(" ");
+  const obj = asObject(value);
+  if (!obj) return "";
+  return Object.values(obj).map(primitiveValuesText).filter(Boolean).join(" ");
+}
+
+function structuredTerms(text: string, maxTerms = 160): string[] {
+  const terms: string[] = [];
+  const seen = new Set<string>();
+  const normalized = text.toLowerCase().replace(/[_/.-]+/g, " ");
+  const matches = normalized.match(/[a-z0-9][a-z0-9]+/g) || [];
+  for (const raw of matches) {
+    if (raw.length < 3 && !/^\d{2,}$/.test(raw)) continue;
+    if (STRUCTURED_STOPWORDS.has(raw)) continue;
+    if (/^\d{5,}$/.test(raw)) continue;
+    if (seen.has(raw)) continue;
+    seen.add(raw);
+    terms.push(raw);
+    if (terms.length >= maxTerms) break;
+  }
+  return terms;
+}
+
+function overlapTerms(terms: string[], evidence: Set<string>, limit = 24): string[] {
+  const result: string[] = [];
+  for (const term of terms) {
+    if (!evidence.has(term) || result.includes(term)) continue;
+    result.push(term);
+    if (result.length >= limit) break;
+  }
+  return result;
+}
+
+function parseStructuredPayload(event: TraceEvent): Record<string, any> | undefined {
+  const raw = event.raw || {};
+  if (typeof raw.content === "string") {
+    const parsed = asObject(safeJsonParse(raw.content));
+    if (parsed) return parsed;
+  }
+  if (asObject(raw.content)) return asObject(raw.content);
+  if (asObject(raw.tool_args)) return { name: raw.tool_name || event.toolName, arguments: raw.tool_args };
+  if (asObject(raw.input)) return { name: raw.name || event.toolName, arguments: raw.input };
+  return undefined;
+}
+
+function extractStructuredCall(event: TraceEvent, ordinal: number, contextTerms: Set<string>): StructuredToolCall | undefined {
+  const raw = event.raw || {};
+  if (!(event.kind === "tool_call" || raw.type === "tool_call" || event.kind.includes("tool_call"))) return undefined;
+  if (event.kind === "tool_call_result") return undefined;
+  const metadata = asObject(raw.metadata);
+  const payload = parseStructuredPayload(event);
+  const args = payload?.arguments ?? payload?.input ?? raw.tool_args ?? raw.input ?? {};
+  const argumentText = primitiveValuesText(args);
+  const argumentTerms = structuredTerms(argumentText, 80);
+  const groundingTerms = overlapTerms(argumentTerms, contextTerms, 16);
+  return {
+    id: stringValue(raw.tool_call_id || raw.callID || raw.id) || `call-${ordinal}`,
+    event_index: event.index,
+    tool_name: stringValue(payload?.name || raw.tool_name || metadata?.tool_name || event.toolName),
+    arguments_text: snippet(argumentText || toText(args), 500),
+    argument_terms: argumentTerms,
+    grounded: argumentTerms.length === 0 || groundingTerms.length > 0,
+    grounding_terms: groundingTerms,
+    snippet: snippet(event.text || toText(payload || raw), 500),
+  };
+}
+
+function extractStructuredResult(event: TraceEvent, ordinal: number): StructuredToolResult | undefined {
+  const raw = event.raw || {};
+  if (!(event.kind === "tool_result" || raw.type === "tool_result" || event.role === "tool")) return undefined;
+  const metadata = asObject(raw.metadata);
+  const text = event.text || toText(raw.content || raw.output || raw.tool_output || raw);
+  return {
+    id: stringValue(raw.tool_call_id || raw.callID || raw.tool_use_id || raw.id) || `result-${ordinal}`,
+    event_index: event.index,
+    tool_name: stringValue(raw.tool_name || metadata?.tool_name || event.toolName),
+    chars: text.length,
+    evidence_terms: structuredTerms(text, 220),
+    snippet: snippet(text, 500),
+  };
+}
+
+function splitClaims(text: string): string[] {
+  return text
+    .replace(/\s+/g, " ")
+    .split(/(?<=[.!?。！？])\s+|(?:\n|^)\s*(?:[-*]|\d+[.)])\s+/g)
+    .map((claim) => claim.trim())
+    .filter((claim) => claim.length >= 24);
+}
+
+function finalAnswerEvents(trace: TraceDoc): TraceEvent[] {
+  const explicit = trace.events.filter((event) => event.kind === "final_answer" || event.rawType === "final_answer");
+  if (explicit.length) return explicit;
+  let lastToolIndex = 0;
+  for (const event of trace.events) {
+    if (event.kind.includes("tool") || event.role === "tool") lastToolIndex = event.index;
+  }
+  const afterTool = trace.events.filter((event) => event.role === "assistant" && event.index > lastToolIndex);
+  return afterTool.length ? afterTool.slice(-2) : trace.events.filter((event) => event.role === "assistant").slice(-2);
+}
+
+function structuredSupportTrace(trace: TraceDoc): StructuredSupportReport {
+  const promptText = typeof trace.meta.prompt === "string" ? trace.meta.prompt : "";
+  const contextTerms = new Set(structuredTerms(promptText, 220));
+  const calls: StructuredToolCall[] = [];
+  const results: StructuredToolResult[] = [];
+  const pairs: StructuredToolPair[] = [];
+  const orphanResults: StructuredToolResult[] = [];
+  const pending: StructuredToolCall[] = [];
+  let callOrdinal = 1;
+  let resultOrdinal = 1;
+
+  for (const event of trace.events) {
+    const call = extractStructuredCall(event, callOrdinal, contextTerms);
+    if (call) {
+      calls.push(call);
+      pending.push(call);
+      callOrdinal += 1;
+      for (const term of structuredTerms(event.text, 80)) contextTerms.add(term);
+      continue;
+    }
+    const result = extractStructuredResult(event, resultOrdinal);
+    if (result) {
+      results.push(result);
+      resultOrdinal += 1;
+      const byId = result.id.startsWith("result-") ? undefined : pending.find((item) => item.id === result.id);
+      const paired = byId || pending.shift();
+      if (paired) {
+        if (byId) pending.splice(pending.indexOf(byId), 1);
+        pairs.push({
+          call_id: paired.id,
+          result_id: result.id,
+          call_event_index: paired.event_index,
+          result_event_index: result.event_index,
+          tool_name: paired.tool_name || result.tool_name,
+          match_type: byId ? "call_id" : "fifo",
+        });
+      } else {
+        orphanResults.push(result);
+      }
+      for (const term of result.evidence_terms) contextTerms.add(term);
+      continue;
+    }
+    if (event.role === "assistant" || event.role === "user" || event.kind === "reasoning") {
+      for (const term of structuredTerms(event.text, 80)) contextTerms.add(term);
+    }
+  }
+
+  const resultEvidence = new Map<string, Set<string>>();
+  for (const result of results) resultEvidence.set(result.id, new Set(result.evidence_terms));
+  const allEvidenceTerms = new Set(results.flatMap((result) => result.evidence_terms));
+  const promptTerms = new Set(structuredTerms(promptText, 220));
+  const claims: StructuredClaimSupport[] = [];
+  let claimOrdinal = 1;
+  for (const event of finalAnswerEvents(trace)) {
+    for (const claimText of splitClaims(event.text)) {
+      const claimTerms = structuredTerms(claimText, 80);
+      if (claimTerms.length < 3) continue;
+      const evidenceTerms = overlapTerms(claimTerms, allEvidenceTerms, 18);
+      const promptOverlap = overlapTerms(claimTerms, promptTerms, 12);
+      const matchedResultIds: string[] = [];
+      for (const [resultId, terms] of resultEvidence.entries()) {
+        if (overlapTerms(claimTerms, terms, 3).length >= 2) matchedResultIds.push(resultId);
+      }
+      const requiredEvidenceTerms = claimTerms.length <= 6 ? 2 : 3;
+      claims.push({
+        id: `claim-${claimOrdinal}`,
+        event_index: event.index,
+        text: snippet(claimText, 700),
+        claim_terms: claimTerms,
+        evidence_terms: evidenceTerms,
+        prompt_terms: promptOverlap,
+        supported: evidenceTerms.length >= requiredEvidenceTerms || (evidenceTerms.length >= 2 && promptOverlap.length >= 1),
+        matched_result_ids: matchedResultIds.slice(0, 12),
+      });
+      claimOrdinal += 1;
+    }
+  }
+
+  const pairedCallCount = pairs.length;
+  const groundedCallCount = calls.filter((call) => call.grounded).length;
+  const supportedFinalClaimCount = claims.filter((claim) => claim.supported).length;
+  const querySupport = calls.length ? Number((groundedCallCount / calls.length).toFixed(6)) : null;
+  const pairingSupport = calls.length ? Number((pairedCallCount / calls.length).toFixed(6)) : null;
+  const finalAnswerSupport = claims.length ? Number((supportedFinalClaimCount / claims.length).toFixed(6)) : null;
+  const availableScores = [
+    pairingSupport === null ? undefined : { weight: 0.4, value: pairingSupport },
+    querySupport === null ? undefined : { weight: 0.25, value: querySupport },
+    finalAnswerSupport === null ? undefined : { weight: 0.35, value: finalAnswerSupport },
+  ].filter((item): item is { weight: number; value: number } => Boolean(item));
+  const weightSum = availableScores.reduce((sum, item) => sum + item.weight, 0);
+  const support = weightSum ? Number((availableScores.reduce((sum, item) => sum + item.value * item.weight, 0) / weightSum).toFixed(6)) : null;
+
+  return {
+    schema_version: "trace-score-cli/structured-support/v0",
+    generated_at: nowIso(),
+    source: trace.source,
+    format: trace.format,
+    support,
+    call_count: calls.length,
+    result_count: results.length,
+    paired_call_count: pairedCallCount,
+    grounded_call_count: groundedCallCount,
+    final_claim_count: claims.length,
+    supported_final_claim_count: supportedFinalClaimCount,
+    tool_counts: countBy(calls.map((call) => call.tool_name || "unknown")),
+    query_support: querySupport,
+    pairing_support: pairingSupport,
+    final_answer_support: finalAnswerSupport,
+    long_result_count: results.filter((result) => result.chars > 20_000).length,
+    pairs,
+    unpaired_calls: pending,
+    orphan_results: orphanResults,
+    unsupported_final_claims: claims.filter((claim) => !claim.supported).slice(0, 60),
+    sample_supported_claims: claims.filter((claim) => claim.supported).slice(0, 12),
+    notes: [
+      "Structured support is a rule-based metric for search/RAG/API traces where TOR has no filesystem actions.",
+      "It combines tool-call pairing, query grounding against the prompt/context, and lexical support for final-answer claims from prior tool results.",
+      "It is a triage signal, not a biomedical correctness verifier; low support should route to review, not automatically mark the answer wrong.",
+    ],
+  };
+}
+
 async function readOptionalFile(filePath: string | undefined): Promise<string | undefined> {
   if (!filePath) return undefined;
   const stat = await fs.stat(filePath);
@@ -1842,6 +2177,7 @@ Usage:
   trace-score schema --trace <file> [--claimed-schema openai|anthropic|gemini|opencode|arm]
   trace-score stats --trace <file>
   trace-score tor --trace <file>
+  trace-score structured-support --trace <file>
   trace-score user-flags --trace <file>
   trace-score audit-highscore --trace <file> --score <number> [--task task.md] [--submission outputs/] [--llm]
 
@@ -1918,6 +2254,11 @@ async function main(): Promise<void> {
 
   if (command === "tor" || command === "oa-tor" || command === "tool-observation-rate") {
     await writeOutput(torTrace(trace) as unknown as Json, opts);
+    return;
+  }
+
+  if (command === "structured-support" || command === "structured-tool-support" || command === "sts") {
+    await writeOutput(structuredSupportTrace(trace) as unknown as Json, opts);
     return;
   }
 

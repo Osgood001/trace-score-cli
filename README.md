@@ -7,6 +7,8 @@ The v0 focus is post-submission trace quality:
 - deterministic format and completeness gates
 - tool-call schema classification and claimed-vs-actual mismatch flags
 - rule-based observation/action TOR outlier scoring
+- structured scientific-tool support scoring for RAG/API traces where TOR has
+  no filesystem actions
 - user-input localization and intervention classification
 - hack / shortcut heuristics for high-score traces
 - optional OpenAI-compatible LLM audit for expensive high-score review
@@ -16,6 +18,14 @@ Audit design note: when model reasoning / CoT text is available, keep it as
 audit evidence and compare full-trace audit against action/submission-only
 audit. Do not treat the audit score as a direct training reward by default;
 strong optimization against a monitor can select for obfuscated reward hacking.
+
+Structural reward note: ATHENA-R1's scientific-feedback reward is a useful
+baseline for cheap trace gates: format validity, ToolRAG/tool-first behavior,
+minimum tool-call steps, bounded final response length, argument provenance,
+placeholder rejection, and non-redundancy. Keep those as deterministic lint or
+curation tags. They are not enough to prove trace faithfulness because they do
+not verify observation-action causality, evidence support for the conclusion, or
+high-score reward hacking.
 
 Planned follow-up: add task-level topology analysis for multiple attempts on the
 same Harbor task. This should build an action-observation state graph and emit
@@ -94,6 +104,18 @@ trace-score tor --trace ./trace.jsonl --out tor-report.json
 still have high TOR if it first observes leaked checker/spec files and then acts
 consistently with those observations.
 
+Compute support for structured scientific-tool traces such as ATHENA/ToolUniverse
+or FDA-search traces. This combines call/result pairing, query grounding against
+the prompt/context, and lexical support for final-answer claims from prior tool
+results:
+
+```bash
+trace-score structured-support --trace ./scientific-trace.json
+```
+
+`structured-support` is a triage signal, not a biomedical correctness verifier.
+Low support means "send to review"; it does not prove the answer is wrong.
+
 List user-input candidates and intervention labels:
 
 ```bash
@@ -144,6 +166,8 @@ trace-score audit-highscore \
   OpenCode, or ARM/Playground tool-call schema evidence plus mismatch flags
 - `tor`: action support ratio, operation/tool histograms, matched observation
   pairs, and unsupported actions
+- `structured-support`: call/result pairing, grounded query arguments, final
+  answer claim support, unsupported final claims, and long-result counts
 - `gates`: deterministic pass/warn/fail checks
 - `user_flags`: user-input/intervention candidates
 - `hack_flags`: shortcut, leakage, score-targeting, and SFT-cleanliness signals
