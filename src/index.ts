@@ -7,13 +7,15 @@ type OptValue = string | boolean | string[];
 type GateLevel = "pass" | "warn" | "fail";
 type ToolSchemaFamily = "openai" | "anthropic" | "gemini" | "langchain" | "opencode" | "arm" | "unknown";
 type ToolObservationRole = "call" | "result" | "call_result" | "malformed";
+type TorSemanticType = "observe" | "act" | "verify";
+type TorSupportType = "exact" | "parent" | "child" | "basename" | "same_command";
 type Recommendation =
   | "keep_for_training"
   | "needs_human_review"
   | "drop_for_training"
   | "negative_example_candidate";
 
-const VERSION = "0.1.2";
+const VERSION = "0.1.3";
 const DEFAULT_MODEL = "aliyun/deepseek-v4-pro";
 const DEFAULT_API_BASE = "https://open.bohrium.com/openapi/v1";
 const HIGH_SCORE_THRESHOLD = 70;
@@ -106,6 +108,55 @@ interface ToolSchemaSummary {
   missing_tool_results: string[];
   orphan_tool_results: string[];
   observations: ToolSchemaObservation[];
+}
+
+interface TorOperation {
+  id: string;
+  event_index: number;
+  turn_index: number;
+  semantic_type: TorSemanticType;
+  operation: string;
+  tool_name?: string;
+  command: string;
+  resources: string[];
+  read_resources: string[];
+  write_resources: string[];
+  reasons: string[];
+  snippet: string;
+}
+
+interface TorPair {
+  action_id: string;
+  action_event_index: number;
+  action_operation: string;
+  action_resource: string;
+  observation_id: string;
+  observation_event_index: number;
+  observation_operation: string;
+  observation_resource: string;
+  match_type: TorSupportType;
+}
+
+interface TorReport {
+  schema_version: "trace-score-cli/tor/v0";
+  generated_at: string;
+  source: string;
+  format: string;
+  tor: number | null;
+  action_count: number;
+  supported_action_count: number;
+  observation_count: number;
+  verify_count: number;
+  same_command_supported_action_count: number;
+  unsupported_action_count: number;
+  semantic_type_counts: Record<string, number>;
+  operation_counts: Record<string, number>;
+  tool_counts: Record<string, number>;
+  resource_counts: Record<string, number>;
+  pairs: TorPair[];
+  unsupported_actions: TorOperation[];
+  operations: TorOperation[];
+  notes: string[];
 }
 
 interface LintReport {
@@ -1140,6 +1191,542 @@ function lintTrace(trace: TraceDoc, scoreInput?: number, claimedSchema?: string)
   };
 }
 
+function compactUnique(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean))).sort();
+}
+
+function stripShellQuotes(value: string): string {
+  const trimmed = value.trim();
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith("`") && trimmed.endsWith("`"))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function cleanResourceToken(value: string): string {
+  let text = stripShellQuotes(value.trim());
+  text = text.replace(/^<path>/, "").replace(/<\/path>$/, "");
+  text = text.replace(/^file:\/\//, "");
+  text = text.replace(/^[A-Za-z_][A-Za-z0-9_]*\((['"`]?)/, "$1");
+  text = text.replace(/^[({[]+/, "").replace(/[),.;\]}]+$/, "");
+  return stripShellQuotes(text);
+}
+
+function looksLikeResource(value: string): boolean {
+  const text = cleanResourceToken(value);
+  if (!text || text === "-" || text === "--") return false;
+  if (/^(https?|ftp):\/\//i.test(text)) return false;
+  if (/^\d+$/.test(text)) return false;
+  if (/^[A-Z_][A-Z0-9_]*=/.test(text)) return false;
+  if (text.startsWith("--")) return false;
+  if (/^[$~./]/.test(text)) return true;
+  if (text.includes("/")) return true;
+  if (/\.[A-Za-z0-9]{1,8}$/.test(text)) return true;
+  return false;
+}
+
+function normalizeResource(value: string, cwd?: string): string | undefined {
+  const cleaned = cleanResourceToken(value);
+  if (!looksLikeResource(cleaned)) return undefined;
+  if (/^(https?|ftp):\/\//i.test(cleaned)) return undefined;
+  if (/^(?:bohrclaw|aliyun|deepseek|openai|anthropic|gemini|qwen|glm|doubao|minimax)\//i.test(cleaned)) return undefined;
+  if (/^\d?>/.test(cleaned)) return undefined;
+  if (/[*?[\]{}]/.test(cleaned)) return cleaned.replace(/\\/g, "/");
+  if (cleaned === ".") return cwd ? path.posix.normalize(cwd.replace(/\\/g, "/")) : ".";
+  if (/^[$~]/.test(cleaned)) return path.posix.normalize(cleaned.replace(/\\/g, "/"));
+  if (path.posix.isAbsolute(cleaned)) return path.posix.normalize(cleaned.replace(/\\/g, "/"));
+  if (cwd && path.posix.isAbsolute(cwd)) return path.posix.normalize(path.posix.join(cwd.replace(/\\/g, "/"), cleaned.replace(/\\/g, "/")));
+  return path.posix.normalize(cleaned.replace(/\\/g, "/"));
+}
+
+function normalizeResources(values: string[], cwd?: string): string[] {
+  return compactUnique(values.map((value) => normalizeResource(value, cwd)).filter((value): value is string => Boolean(value)));
+}
+
+function shellTokens(command: string): string[] {
+  const tokens: string[] = [];
+  const regex = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|`([^`]*)`|[^\s]+/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(command)) !== null) {
+    tokens.push(match[1] ?? match[2] ?? match[3] ?? match[0]);
+  }
+  return tokens;
+}
+
+function splitShellSegments(command: string): string[] {
+  return command
+    .replace(/\\\n/g, " ")
+    .split(/\s*(?:&&|\|\||;|\n)\s*/g)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
+function commandName(token: string | undefined): string {
+  if (!token) return "";
+  const cleaned = stripShellQuotes(token).trim();
+  const base = cleaned.split("/").pop() || cleaned;
+  return base.toLowerCase();
+}
+
+function extractRedirectionWrites(segment: string, cwd?: string): string[] {
+  const paths: string[] = [];
+  const regex = /(?:^|\s)(?:\d?>|>>|&>)\s*([^\s|;&]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(segment)) !== null) {
+    const normalized = normalizeResource(match[1], cwd);
+    if (normalized) paths.push(normalized);
+  }
+  return compactUnique(paths);
+}
+
+function extractFlagResources(tokens: string[], flags: string[], cwd?: string): string[] {
+  const result: string[] = [];
+  const flagSet = new Set(flags);
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    const eq = token.indexOf("=");
+    const key = eq >= 0 ? token.slice(0, eq) : token;
+    if (!flagSet.has(key)) continue;
+    const value = eq >= 0 ? token.slice(eq + 1) : tokens[i + 1];
+    if (!value) continue;
+    const normalized = normalizeResource(value, cwd);
+    if (normalized) result.push(normalized);
+    if (eq < 0) i += 1;
+  }
+  return compactUnique(result);
+}
+
+function shellOptionConsumesValue(token: string): boolean {
+  if (token.includes("=")) return false;
+  return /^(?:-f|-o|-C|-I|-e|-m|-n|-p|-c|-d|-t|-name|-path|-type|-maxdepth|-mindepth|-mtime|-size|-exec|--out|--output|--outputs|--trace|--raw-messages|--workdir|--cwd|--input|--file|--task|--submission|--harbor-task|--challenge-id|--target|--prefix|--model)$/.test(token);
+}
+
+function pathArgs(tokens: string[], startIndex: number, cwd?: string, options: { includeBare?: boolean; skipFirstNonOption?: boolean } = {}): string[] {
+  const result: string[] = [];
+  let skippedFirstNonOption = false;
+  for (let i = startIndex; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (!token || token === "|" || token === ">" || token === ">>" || token === "2>" || token === "1>") {
+      i += token?.includes(">") ? 1 : 0;
+      continue;
+    }
+    if (token.startsWith("-")) {
+      if (shellOptionConsumesValue(token)) i += 1;
+      continue;
+    }
+    if (options.skipFirstNonOption && !skippedFirstNonOption) {
+      skippedFirstNonOption = true;
+      continue;
+    }
+    const normalized = normalizeResource(token, cwd);
+    if (normalized) {
+      result.push(normalized);
+      continue;
+    }
+    if (options.includeBare && /^[A-Za-z0-9_.-]+$/.test(token) && !/^[A-Z_][A-Z0-9_]*=/.test(token)) {
+      result.push(path.posix.normalize(cwd && path.posix.isAbsolute(cwd) ? path.posix.join(cwd, token) : token));
+    }
+  }
+  return compactUnique(result);
+}
+
+function recursivelyExtractResources(value: unknown, cwd?: string, keyHint = ""): string[] {
+  const result: string[] = [];
+  if (typeof value === "string") {
+    const isResourceKey = /(path|file|dir|out|output|trace|workspace|cwd|workdir|submission)/i.test(keyHint);
+    const isCompactResourceLiteral = !keyHint && value.length < 240 && !/\s/.test(value) && looksLikeResource(value);
+    if (isResourceKey || isCompactResourceLiteral) {
+      const normalized = normalizeResource(value, cwd);
+      if (normalized) result.push(normalized);
+    }
+    return result;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) result.push(...recursivelyExtractResources(item, cwd, keyHint));
+    return compactUnique(result);
+  }
+  const obj = asObject(value);
+  if (!obj) return result;
+  for (const [key, item] of Object.entries(obj)) {
+    result.push(...recursivelyExtractResources(item, cwd, key));
+  }
+  return compactUnique(result);
+}
+
+function operationFromShellSegment(segment: string, cwd: string | undefined, idBase: string, turn: number): { op: TorOperation; nextCwd?: string } | undefined {
+  const tokens = shellTokens(segment);
+  if (!tokens.length) return undefined;
+  const cmd = commandName(tokens[0]);
+  if (!cmd || /^[A-Z_][A-Z0-9_]*=/.test(tokens[0])) return undefined;
+
+  if (cmd === "cd") {
+    const next = normalizeResource(tokens[1] || ".", cwd);
+    return {
+      op: {
+        id: `${idBase}-cd`,
+        event_index: turn,
+        turn_index: turn,
+        semantic_type: "observe",
+        operation: "change_directory",
+        command: segment,
+        resources: next ? [next] : [],
+        read_resources: next ? [next] : [],
+        write_resources: [],
+        reasons: ["cd records the working directory for later relative paths."],
+        snippet: snippet(segment, 240),
+      },
+      nextCwd: next,
+    };
+  }
+
+  const redirectionWrites = extractRedirectionWrites(segment, cwd);
+  const outputFlags = extractFlagResources(tokens, ["--out", "--output", "--outputs", "--output-dir", "--raw-out", "--raw-messages", "--trace", "-o"], cwd);
+  const commonReadFlags = extractFlagResources(tokens, ["--trace", "--input", "--file", "--task", "--submission", "--harbor-task"], cwd);
+  let semantic: TorSemanticType = "verify";
+  let operation = "execute";
+  let readResources: string[] = [];
+  let writeResources: string[] = [...redirectionWrites];
+  const reasons: string[] = [];
+
+  const observeCommands = new Set(["cat", "head", "tail", "less", "more", "ls", "find", "stat", "wc", "du", "tree", "file", "pwd"]);
+  const searchCommands = new Set(["grep", "rg", "ag", "ack"]);
+  const writeCommands = new Set(["tee", "cp", "mv", "rm", "mkdir", "touch", "chmod", "chown", "ln", "install"]);
+  const execCommands = new Set(["python", "python3", "node", "bash", "sh", "zsh", "ruby", "perl", "Rscript", "julia"]);
+
+  if (observeCommands.has(cmd)) {
+    semantic = redirectionWrites.length ? "act" : "observe";
+    operation = redirectionWrites.length ? `${cmd}_write` : cmd === "pwd" ? "read_cwd" : "read";
+    readResources = cmd === "pwd" ? (cwd ? [cwd] : []) : pathArgs(tokens, 1, cwd, { includeBare: cmd === "ls" || cmd === "find" });
+    writeResources.push(...outputFlags);
+    reasons.push(redirectionWrites.length ? "Read command writes redirected output." : "Read/list command is an observation.");
+  } else if (searchCommands.has(cmd)) {
+    semantic = redirectionWrites.length || outputFlags.length ? "act" : "observe";
+    operation = redirectionWrites.length || outputFlags.length ? "search_write" : "search";
+    readResources = pathArgs(tokens, 1, cwd, { skipFirstNonOption: true });
+    writeResources.push(...outputFlags);
+    reasons.push(redirectionWrites.length || outputFlags.length ? "Search command writes results." : "Search command is an observation.");
+  } else if (cmd === "sed") {
+    const inPlace = tokens.some((token) => token === "-i" || token.startsWith("-i"));
+    semantic = inPlace || redirectionWrites.length ? "act" : "observe";
+    operation = inPlace ? "edit" : redirectionWrites.length ? "sed_write" : "read";
+    readResources = pathArgs(tokens, 1, cwd);
+    writeResources.push(...(inPlace ? readResources : outputFlags));
+    reasons.push(inPlace ? "sed -i edits files." : redirectionWrites.length ? "sed writes redirected output." : "sed without -i is an observation.");
+  } else if (cmd === "echo" || cmd === "printf") {
+    semantic = redirectionWrites.length || outputFlags.length ? "act" : "verify";
+    operation = redirectionWrites.length || outputFlags.length ? "write" : "print";
+    writeResources.push(...outputFlags);
+    reasons.push(semantic === "act" ? "Shell print command writes redirected output." : "Shell print command has no durable resource.");
+  } else if (cmd === "tee") {
+    semantic = "act";
+    operation = "write";
+    writeResources.push(...pathArgs(tokens, 1, cwd, { includeBare: true }));
+    reasons.push("tee writes one or more target files.");
+  } else if (writeCommands.has(cmd)) {
+    semantic = "act";
+    operation = cmd === "rm" ? "delete" : cmd === "mkdir" ? "create_directory" : cmd === "touch" ? "write" : cmd;
+    const resources = pathArgs(tokens, 1, cwd, { includeBare: cmd === "mkdir" || cmd === "touch" });
+    readResources = cmd === "cp" || cmd === "mv" ? resources.slice(0, -1) : [];
+    writeResources.push(...resources);
+    reasons.push(`${cmd} changes filesystem state.`);
+  } else if (cmd === "pytest" || (cmd === "python" && tokens[1] === "-m" && tokens[2] === "pytest") || (cmd === "npm" && tokens[1] === "test")) {
+    semantic = "verify";
+    operation = "verify";
+    readResources = pathArgs(tokens, cmd === "python" ? 3 : 1, cwd);
+    reasons.push("Test command is classified as verification.");
+  } else if (cmd === "playground") {
+    const sub = tokens.slice(1, 4).join(" ");
+    if (/submit|task download|harbor convert|data pull|config init/.test(sub)) {
+      semantic = "act";
+      operation = sub.includes("submit") ? "submit" : sub.includes("download") || sub.includes("pull") ? "download" : sub.includes("convert") ? "convert" : "configure";
+      writeResources.push(...extractFlagResources(tokens, ["--out", "--outputs", "--trace", "--raw-messages"], cwd));
+      readResources.push(...extractFlagResources(tokens, ["--harbor-task", "--trace", "--outputs"], cwd));
+      reasons.push(`playground ${sub} changes local or remote task state.`);
+    } else {
+      semantic = "verify";
+      operation = "status";
+      readResources.push(...commonReadFlags);
+      reasons.push(`playground ${sub || "command"} is treated as status/verification.`);
+    }
+  } else if (execCommands.has(cmd)) {
+    semantic = redirectionWrites.length ? "act" : "act";
+    operation = "execute";
+    const offset = (cmd === "python" || cmd === "python3") && tokens[1] === "-m" ? 3 : 1;
+    readResources = pathArgs(tokens, offset, cwd);
+    writeResources.push(...outputFlags);
+    reasons.push("Program execution may transform resources; classify as action unless it is a known test command.");
+  } else {
+    readResources = pathArgs(tokens, 1, cwd);
+    writeResources.push(...outputFlags);
+    if (redirectionWrites.length || outputFlags.length) {
+      semantic = "act";
+      operation = "write";
+      reasons.push("Unknown shell command writes redirected or flagged output.");
+    } else if (readResources.length) {
+      semantic = "act";
+      operation = "execute";
+      reasons.push("Unknown shell command with path resources is treated as an action for conservative TOR review.");
+    } else {
+      semantic = "verify";
+      operation = "execute";
+      reasons.push("Unknown shell command has no extracted resources.");
+    }
+  }
+
+  readResources = compactUnique([...readResources, ...commonReadFlags]);
+  writeResources = compactUnique(writeResources);
+  const resources = compactUnique([...readResources, ...writeResources]);
+  return {
+    op: {
+      id: idBase,
+      event_index: turn,
+      turn_index: turn,
+      semantic_type: semantic,
+      operation,
+      tool_name: "bash",
+      command: segment,
+      resources,
+      read_resources: readResources,
+      write_resources: writeResources,
+      reasons,
+      snippet: snippet(segment, 240),
+    },
+  };
+}
+
+function shellOperations(command: string, event: TraceEvent, cwd?: string): TorOperation[] {
+  const operations: TorOperation[] = [];
+  let currentCwd = normalizeResource(cwd || "") || cwd;
+  const segments = splitShellSegments(command);
+  for (let i = 0; i < segments.length; i += 1) {
+    const parsed = operationFromShellSegment(segments[i], currentCwd, `op-${event.index}-${i + 1}`, event.index);
+    if (!parsed) continue;
+    operations.push({
+      ...parsed.op,
+      event_index: event.index,
+      turn_index: event.index,
+    });
+    if (parsed.nextCwd) currentCwd = parsed.nextCwd;
+  }
+  return operations;
+}
+
+function toolInputObject(event: TraceEvent): Record<string, any> {
+  const raw = event.raw || {};
+  const state = asObject(raw.state);
+  return asObject(raw.tool_args) || asObject(state?.input) || asObject(raw.input) || {};
+}
+
+function toolCommandString(input: Record<string, any>, event: TraceEvent): string | undefined {
+  return stringValue(input.command) || stringValue(input.cmd) || stringValue(input.script) || (event.toolName === "bash" ? event.text : undefined);
+}
+
+function operationFromStructuredTool(event: TraceEvent, index: number): TorOperation[] {
+  const raw = event.raw || {};
+  if (raw.step_type === "tool_result" || event.kind === "tool_result") return [];
+  if (event.kind === "artifact" || raw.type === "artifact" || raw.artifact_path) {
+    const resources = normalizeResources([toText(raw.artifact_path || raw.path || raw.filePath || event.title || "")]);
+    return [{
+      id: `op-${event.index}-${index}`,
+      event_index: event.index,
+      turn_index: event.index,
+      semantic_type: "act",
+      operation: "write_artifact",
+      command: event.text || event.title || toText(raw),
+      resources,
+      read_resources: [],
+      write_resources: resources,
+      reasons: ["Trace artifact event records a durable output."],
+      snippet: snippet(event.text || event.title || toText(raw), 240),
+    }];
+  }
+  if ((event.kind === "observation" || raw.type === "observation") && !(event.kind.includes("tool") || event.role === "tool" || event.toolName)) {
+    const resources = normalizeResources([toText(raw.artifact_path || raw.path || raw.filePath || raw.file_path || event.title || "")]);
+    if (!resources.length) return [];
+    return [{
+      id: `op-${event.index}-${index}`,
+      event_index: event.index,
+      turn_index: event.index,
+      semantic_type: "observe",
+      operation: "observe",
+      command: event.text || event.title || toText(raw),
+      resources,
+      read_resources: resources,
+      write_resources: [],
+      reasons: ["Typed observation event includes resource references."],
+      snippet: snippet(event.text || event.title || toText(raw), 240),
+    }];
+  }
+  if (!(event.kind.includes("tool") || event.role === "tool" || event.toolName)) return [];
+
+  const toolName = (event.toolName || event.title || stringValue(raw.tool_name) || stringValue(raw.tool) || "").toLowerCase();
+  const input = toolInputObject(event);
+  const cwd = stringValue(input.workdir) || stringValue(input.cwd);
+  const command = toolCommandString(input, event);
+  if ((toolName === "bash" || toolName === "shell" || toolName === "terminal") && command) {
+    return shellOperations(command, event, cwd);
+  }
+
+  const resources = recursivelyExtractResources(input, cwd);
+  let semantic: TorSemanticType = "verify";
+  let operation = "tool";
+  const reasons: string[] = [];
+  if (/^(read|view|open|glob|grep|search|list|ls|find)$/.test(toolName)) {
+    semantic = "observe";
+    operation = toolName === "grep" || toolName === "search" ? "search" : "read";
+    reasons.push("Structured read/search/list tool is an observation.");
+  } else if (/^(write|edit|multiedit|apply_patch|patch|delete|remove)$/.test(toolName)) {
+    semantic = "act";
+    operation = /delete|remove/.test(toolName) ? "delete" : /edit|patch/.test(toolName) ? "edit" : "write";
+    reasons.push("Structured write/edit/delete tool changes resources.");
+  } else if (/^(todowrite|task|status|validate|test)$/.test(toolName)) {
+    semantic = "verify";
+    operation = toolName === "todowrite" ? "plan_update" : "verify";
+    reasons.push("Planning/status/validation tool is not counted as a task action.");
+  } else if (resources.length) {
+    semantic = "act";
+    operation = "tool_action";
+    reasons.push("Unknown structured tool touches resources; classify as action for review.");
+  } else {
+    semantic = "verify";
+    operation = "tool";
+    reasons.push("Unknown structured tool has no extracted resource.");
+  }
+  return [{
+    id: `op-${event.index}-${index}`,
+    event_index: event.index,
+    turn_index: event.index,
+    semantic_type: semantic,
+    operation,
+    tool_name: toolName || undefined,
+    command: command || toText(input || event.raw || event.text),
+    resources,
+    read_resources: semantic === "observe" || semantic === "verify" ? resources : [],
+    write_resources: semantic === "act" ? resources : [],
+    reasons,
+    snippet: snippet(command || event.text || toText(input), 240),
+  }];
+}
+
+function buildTorOperations(events: TraceEvent[]): TorOperation[] {
+  const operations: TorOperation[] = [];
+  for (const event of events) {
+    const next = operationFromStructuredTool(event, operations.length + 1);
+    operations.push(...next);
+  }
+  return operations.map((operation, i) => ({ ...operation, id: `op-${i + 1}` }));
+}
+
+function pathMatchType(observed: string, acted: string): TorSupportType | undefined {
+  if (!observed || !acted) return undefined;
+  if (observed === acted) return "exact";
+  if (acted.startsWith(`${observed.replace(/\/$/, "")}/`)) return "parent";
+  if (observed.startsWith(`${acted.replace(/\/$/, "")}/`)) return "child";
+  const observedBase = path.posix.basename(observed);
+  const actedBase = path.posix.basename(acted);
+  if (observedBase && actedBase && observedBase === actedBase && observedBase.includes(".")) return "basename";
+  return undefined;
+}
+
+function supportForAction(action: TorOperation, observations: TorOperation[]): TorPair | undefined {
+  const actionResources = compactUnique([...action.write_resources, ...action.read_resources, ...action.resources]);
+  for (const actionResource of actionResources) {
+    for (let i = observations.length - 1; i >= 0; i -= 1) {
+      const observation = observations[i];
+      for (const observationResource of observation.resources) {
+        const matchType = pathMatchType(observationResource, actionResource);
+        if (!matchType) continue;
+        return {
+          action_id: action.id,
+          action_event_index: action.event_index,
+          action_operation: action.operation,
+          action_resource: actionResource,
+          observation_id: observation.id,
+          observation_event_index: observation.event_index,
+          observation_operation: observation.operation,
+          observation_resource: observationResource,
+          match_type: matchType,
+        };
+      }
+    }
+  }
+  return undefined;
+}
+
+function sameCommandSupport(action: TorOperation): boolean {
+  if (!action.read_resources.length || !action.write_resources.length) return false;
+  return action.read_resources.some((readResource) => action.write_resources.some((writeResource) => pathMatchType(readResource, writeResource) !== undefined));
+}
+
+function resourceCounts(operations: TorOperation[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const resource of operations.flatMap((operation) => operation.resources)) {
+    counts[resource] = (counts[resource] || 0) + 1;
+  }
+  return Object.fromEntries(Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 80));
+}
+
+function torTrace(trace: TraceDoc): TorReport {
+  const operations = buildTorOperations(trace.events);
+  const observations: TorOperation[] = [];
+  const pairs: TorPair[] = [];
+  const unsupportedActions: TorOperation[] = [];
+  let sameCommandSupported = 0;
+  for (const operation of operations) {
+    if (operation.semantic_type === "observe") {
+      observations.push(operation);
+      continue;
+    }
+    if (operation.semantic_type !== "act") continue;
+    const support = supportForAction(operation, observations);
+    if (support) {
+      pairs.push(support);
+    } else if (sameCommandSupport(operation)) {
+      sameCommandSupported += 1;
+      pairs.push({
+        action_id: operation.id,
+        action_event_index: operation.event_index,
+        action_operation: operation.operation,
+        action_resource: operation.write_resources[0] || operation.resources[0] || "",
+        observation_id: operation.id,
+        observation_event_index: operation.event_index,
+        observation_operation: operation.operation,
+        observation_resource: operation.read_resources[0] || "",
+        match_type: "same_command",
+      });
+    } else {
+      unsupportedActions.push(operation);
+    }
+  }
+  const actionCount = operations.filter((operation) => operation.semantic_type === "act").length;
+  const supportedActionCount = pairs.length;
+  return {
+    schema_version: "trace-score-cli/tor/v0",
+    generated_at: nowIso(),
+    source: trace.source,
+    format: trace.format,
+    tor: actionCount ? Number((supportedActionCount / actionCount).toFixed(6)) : null,
+    action_count: actionCount,
+    supported_action_count: supportedActionCount,
+    observation_count: operations.filter((operation) => operation.semantic_type === "observe").length,
+    verify_count: operations.filter((operation) => operation.semantic_type === "verify").length,
+    same_command_supported_action_count: sameCommandSupported,
+    unsupported_action_count: unsupportedActions.length,
+    semantic_type_counts: countBy(operations.map((operation) => operation.semantic_type)),
+    operation_counts: countBy(operations.map((operation) => operation.operation)),
+    tool_counts: countBy(operations.map((operation) => operation.tool_name || "unknown")),
+    resource_counts: resourceCounts(operations),
+    pairs,
+    unsupported_actions: unsupportedActions.slice(0, 80),
+    operations,
+    notes: [
+      "TOR is a rule-based outlier metric over extracted resources, not a faithfulness verdict.",
+      "Actions are supported only by prior path-aligned observations, except read-write work inside the same command is labeled same_command.",
+      "Shell parsing is intentionally conservative; ambiguous executions are surfaced in unsupported_actions for review.",
+    ],
+  };
+}
+
 async function readOptionalFile(filePath: string | undefined): Promise<string | undefined> {
   if (!filePath) return undefined;
   const stat = await fs.stat(filePath);
@@ -1254,6 +1841,7 @@ Usage:
   trace-score lint --trace <file> [--score <number>] [--out report.json]
   trace-score schema --trace <file> [--claimed-schema openai|anthropic|gemini|opencode|arm]
   trace-score stats --trace <file>
+  trace-score tor --trace <file>
   trace-score user-flags --trace <file>
   trace-score audit-highscore --trace <file> --score <number> [--task task.md] [--submission outputs/] [--llm]
 
@@ -1325,6 +1913,11 @@ async function main(): Promise<void> {
 
   if (command === "stats") {
     await writeOutput(report.stats as unknown as Json, opts);
+    return;
+  }
+
+  if (command === "tor" || command === "oa-tor" || command === "tool-observation-rate") {
+    await writeOutput(torTrace(trace) as unknown as Json, opts);
     return;
   }
 

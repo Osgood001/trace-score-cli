@@ -6,6 +6,7 @@ The v0 focus is post-submission trace quality:
 
 - deterministic format and completeness gates
 - tool-call schema classification and claimed-vs-actual mismatch flags
+- rule-based observation/action TOR outlier scoring
 - user-input localization and intervention classification
 - hack / shortcut heuristics for high-score traces
 - optional OpenAI-compatible LLM audit for expensive high-score review
@@ -81,6 +82,18 @@ Classify structured tool-call schemas and verify a claimed provider family:
 trace-score schema --trace ./trace.jsonl --claimed-schema openai
 ```
 
+Compute rule-based observation/action support. This parses shell and structured
+tool calls, labels operations as `observe`, `act`, or `verify`, and reports the
+fraction of actions with a prior path-aligned observation:
+
+```bash
+trace-score tor --trace ./trace.jsonl --out tor-report.json
+```
+
+`tor` is an outlier tag, not a faithfulness verdict. A reward-hacking trace can
+still have high TOR if it first observes leaked checker/spec files and then acts
+consistently with those observations.
+
 List user-input candidates and intervention labels:
 
 ```bash
@@ -129,6 +142,8 @@ trace-score audit-highscore \
 - `stats`: event, role, tool, token, and cost counters
 - `tool_schema` / `schema_flags`: OpenAI, Anthropic, Gemini, LangChain,
   OpenCode, or ARM/Playground tool-call schema evidence plus mismatch flags
+- `tor`: action support ratio, operation/tool histograms, matched observation
+  pairs, and unsupported actions
 - `gates`: deterministic pass/warn/fail checks
 - `user_flags`: user-input/intervention candidates
 - `hack_flags`: shortcut, leakage, score-targeting, and SFT-cleanliness signals

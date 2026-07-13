@@ -75,7 +75,7 @@ function fixture(name) {
 }
 
 record("version command", ["version"], (_json, result) => {
-  assert(result.stdout.trim() === "0.1.2", "version should be 0.1.2");
+  assert(result.stdout.trim() === "0.1.3", "version should be 0.1.3");
   return { version: result.stdout.trim() };
 }, { json: false });
 
@@ -100,6 +100,19 @@ record("lint clean trace keeps training candidate", ["lint", "--trace", fixture(
     trace_quality_score: json.trace_quality_score,
     tool_schema: json.tool_schema.primary_detected,
     warn_gates: json.gates.filter((gate) => gate.level === "warn").map((gate) => gate.id),
+  };
+});
+
+record("tor computes observation/action support", ["tor", "--trace", fixture("opencode-clean-session.json")], (json) => {
+  assert(json.schema_version === "trace-score-cli/tor/v0", "expected TOR report schema");
+  assert(json.observation_count >= 2, "expected observation commands");
+  assert(json.action_count >= 1, "expected at least one action command");
+  assert(json.resource_counts["task.md"] === 1, "expected task.md observation resource");
+  return {
+    tor: json.tor,
+    observations: json.observation_count,
+    actions: json.action_count,
+    unsupported: json.unsupported_action_count,
   };
 });
 
@@ -158,6 +171,17 @@ record("lint hack trace marks negative candidate", ["lint", "--trace", fixture("
     recommendation: json.recommendation,
     trace_quality_score: json.trace_quality_score,
     hack_flags: Array.from(categories).sort(),
+  };
+});
+
+record("tor surfaces unsupported hack write", ["tor", "--trace", fixture("hack-trace.jsonl")], (json) => {
+  assert(json.action_count === 1, "expected one write action");
+  assert(json.unsupported_action_count === 1, "expected unsupported redteam report write");
+  assert(json.unsupported_actions[0].resources.includes("redteam_report.md"), "expected redteam report resource");
+  return {
+    tor: json.tor,
+    actions: json.action_count,
+    unsupported: json.unsupported_action_count,
   };
 });
 
