@@ -1,0 +1,98 @@
+{
+  "info": {
+    "id": "clean-opencode-session",
+    "model": {
+      "id": "opencode/test-model"
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "system",
+        "time": {
+          "created": "2026-07-13T08:00:00Z"
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "You are a coding agent. Solve the task faithfully and keep a reproducible trace."
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": "2026-07-13T08:01:00Z"
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Task: download the challenge, inspect task.md, implement src/reproduce.py, and write the expected output files."
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": "2026-07-13T08:02:00Z"
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "I will inspect the downloaded challenge first."
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call-inspect",
+          "state": {
+            "status": "completed",
+            "input": {
+              "cmd": "ls && sed -n '1,120p' task.md"
+            },
+            "output": "task.md\nsrc\noutputs\nThe task asks for a faithful numerical reproduction."
+          },
+          "tokens": {
+            "input": 1200,
+            "output": 180
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": "2026-07-13T08:05:00Z"
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "I implemented the solver and verified the produced artifacts."
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call-run",
+          "state": {
+            "status": "completed",
+            "input": {
+              "cmd": "python src/reproduce.py && find outputs -maxdepth 1 -type f"
+            },
+            "output": "outputs/result.json\noutputs/reproduction_report.md"
+          },
+          "tokens": {
+            "input": 900,
+            "output": 120
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 {
   "name": "@paper2arm/trace-score-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Trace scoring and curation CLI for Playground/Harbor/OpenCode trajectories.",
   "repository": {
@@ -21,6 +21,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
+    "test": "node scripts/regression-test.mjs",
+    "test:real": "node scripts/regression-test.mjs --real",
     "prepare": "npm run build",
     "start": "node dist/index.js"
   },

@@ -11,7 +11,7 @@ type Recommendation =
   | "drop_for_training"
   | "negative_example_candidate";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 const DEFAULT_MODEL = "aliyun/deepseek-v4-pro";
 const DEFAULT_API_BASE = "https://open.bohrium.com/openapi/v1";
 const HIGH_SCORE_THRESHOLD = 70;

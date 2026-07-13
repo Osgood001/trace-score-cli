@@ -21,6 +21,27 @@ trace-score --help
 
 The CLI requires Node 20+.
 
+## Test
+
+Run the deterministic fixture suite:
+
+```bash
+npm test
+```
+
+When the local Playground/Harbor evidence tree is available, run the real-trace
+regression pass too:
+
+```bash
+npm run test:real -- --required-real
+```
+
+The real pass exercises:
+
+- a normal Playground attempt trace from attempt 34
+- an OpenCode red-team trace that should become `negative_example_candidate`
+- the corresponding raw OpenCode messages for user-intervention labels
+
 ## Common Commands
 
 Inspect an ARM or OpenCode trace:
