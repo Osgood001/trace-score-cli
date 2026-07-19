@@ -11,6 +11,9 @@ The v0 focus is post-submission trace quality:
   no filesystem actions
 - user-input localization and intervention classification
 - hack / shortcut heuristics for high-score traces
+- deterministic provenance extractors for reference-value copy, red-team prompt
+  mirror, high-score/no-artifact contradictions, fallback outputs, missing
+  execution evidence, and positive computation evidence
 - optional OpenAI-compatible LLM audit for expensive high-score review
 - JSON output suitable for a Playground sidecar evaluator
 
@@ -164,6 +167,10 @@ trace-score audit-highscore \
 - `stats`: event, role, tool, token, and cost counters
 - `tool_schema` / `schema_flags`: OpenAI, Anthropic, Gemini, LangChain,
   OpenCode, or ARM/Playground tool-call schema evidence plus mismatch flags
+- `provenance`: deterministic gray-zone gates with separate `hack_risk` and
+  `provenance_sufficiency`; missing evidence and fallback language route to
+  review, while reference-copy/red-team mirror/high-score-without-artifacts can
+  raise hack-risk flags
 - `tor`: action support ratio, operation/tool histograms, matched observation
   pairs, and unsupported actions
 - `structured-support`: call/result pairing, grounded query arguments, final

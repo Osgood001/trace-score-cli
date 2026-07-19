@@ -75,7 +75,7 @@ function fixture(name) {
 }
 
 record("version command", ["version"], (_json, result) => {
-  assert(result.stdout.trim() === "0.1.4", "version should be 0.1.4");
+  assert(result.stdout.trim() === "0.1.5", "version should be 0.1.5");
   return { version: result.stdout.trim() };
 }, { json: false });
 
@@ -140,6 +140,22 @@ record("schema validates Anthropic tool loop", ["schema", "--trace", fixture("an
   };
 });
 
+record("schema accepts LangChain function_name tool calls", ["schema", "--trace", fixture("langchain-function-name-tools.json")], (json) => {
+  assert(json.tool_schema.primary_detected === "langchain", "expected LangChain schema detection");
+  assert(json.tool_schema.calls === 1, "expected one LangChain tool call");
+  assert(json.tool_schema.results === 1, "expected one LangChain tool result");
+  assert(json.tool_schema.matched_call_ids === 1, "expected LangChain call/result pairing");
+  assert(json.tool_schema.observations[0].toolName === "Write", "expected function_name as tool name");
+  assert(json.tool_schema.observations[0].callId === "call_write_1", "expected tool_call_id as call id");
+  assert(!json.schema_flags.some((flag) => flag.category === "malformed_tool_call_schema"), "function_name call should not be malformed");
+  return {
+    detected: json.tool_schema.primary_detected,
+    schemas: json.tool_schema.detected_schemas,
+    calls: json.tool_schema.calls,
+    results: json.tool_schema.results,
+  };
+});
+
 record("schema detects malformed OpenAI arguments", ["lint", "--trace", fixture("openai-malformed-args.json"), "--score", "91"], (json) => {
   const categories = new Set(json.schema_flags.map((flag) => flag.category));
   assert(json.tool_schema.primary_detected === "openai", "expected OpenAI schema detection");
@@ -167,10 +183,40 @@ record("lint hack trace marks negative candidate", ["lint", "--trace", fixture("
   assert(categories.has("score_targeting"), "expected score targeting flag");
   assert(categories.has("benchmark_loophole"), "expected benchmark loophole flag");
   assert(categories.has("sft_unclean"), "expected SFT cleanliness flag");
+  assert(categories.has("reference_value_copy"), "expected deterministic reference-copy flag");
+  assert(categories.has("redteam_prompt_mirror"), "expected deterministic red-team mirror flag");
+  assert(json.provenance.hack_risk >= 80, "expected high deterministic provenance hack risk");
+  assert(json.provenance.triggered_gates.includes("G1_reference_value_copy"), "expected G1 provenance gate");
+  assert(json.provenance.triggered_gates.includes("G2_redteam_prompt_mirror"), "expected G2 provenance gate");
   return {
     recommendation: json.recommendation,
     trace_quality_score: json.trace_quality_score,
     hack_flags: Array.from(categories).sort(),
+    provenance: {
+      hack_risk: json.provenance.hack_risk,
+      provenance_sufficiency: json.provenance.provenance_sufficiency,
+      gates: json.provenance.triggered_gates,
+    },
+  };
+});
+
+record("provenance keeps honest fallback in review lane", ["lint", "--trace", fixture("honest-fallback-computation.jsonl"), "--score", "5"], (json) => {
+  const categories = new Set(json.hack_flags.map((flag) => flag.category));
+  assert(json.recommendation === "needs_human_review", "low-score honest fallback should stay in human review");
+  assert(!categories.has("surrogate_highscore_without_computation"), "fallback should not escalate without high score and missing computation");
+  assert(json.provenance.hack_risk < 50, "positive computation should keep hack risk low");
+  assert(json.provenance.provenance_sufficiency >= 40, "computed fallback should retain reviewable provenance");
+  assert(json.provenance.triggered_gates.includes("G4_surrogate_or_fallback_outputs"), "expected fallback provenance gate");
+  assert(json.provenance.triggered_gates.includes("G6_positive_computation_evidence"), "expected positive computation guard");
+  return {
+    recommendation: json.recommendation,
+    trace_quality_score: json.trace_quality_score,
+    hack_flags: Array.from(categories).sort(),
+    provenance: {
+      hack_risk: json.provenance.hack_risk,
+      provenance_sufficiency: json.provenance.provenance_sufficiency,
+      gates: json.provenance.triggered_gates,
+    },
   };
 });
 

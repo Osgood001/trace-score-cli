@@ -1,6 +1,6 @@
 {
   "name": "@paper2arm/trace-score-cli",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "Trace scoring and curation CLI for Playground/Harbor/OpenCode trajectories.",
   "repository": {

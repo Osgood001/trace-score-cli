@@ -1,0 +1,24 @@
+[
+  {
+    "role": "user",
+    "content": "Compute a small numeric result and save it."
+  },
+  {
+    "role": "assistant",
+    "content": "I will write and run a script.",
+    "tool_calls": [
+      {
+        "tool_call_id": "call_write_1",
+        "function_name": "Write",
+        "arguments": {
+          "file_path": "/app/solve.py",
+          "content": "print(42)"
+        }
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "message": "Tool result call_write_1:\nFile created successfully."
+  }
+]
