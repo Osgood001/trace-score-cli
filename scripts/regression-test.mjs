@@ -75,7 +75,7 @@ function fixture(name) {
 }
 
 record("version command", ["version"], (_json, result) => {
-  assert(result.stdout.trim() === "0.1.5", "version should be 0.1.5");
+  assert(result.stdout.trim() === "0.2.0-beta.3", "version should be 0.2.0-beta.3");
   return { version: result.stdout.trim() };
 }, { json: false });
 
@@ -274,6 +274,34 @@ record("audit-highscore emits deterministic prompt", ["audit-highscore", "--trac
     should_audit: json.should_audit,
     deterministic_recommendation: json.deterministic_report.recommendation,
     prompt_chars: json.llm_prompt.length,
+  };
+});
+
+record("score produces label-free automatic three-layer fusion", [
+  "score",
+  "--trace", fixture("opencode-clean-session.json"),
+  "--task", "README.md",
+  "--llm-result", fixture("llm-faithful.json"),
+], (json) => {
+  assert(json.schema_version === "trace-score-cli/score/v1", "expected unified score schema");
+  assert(json.engine === "trace-score-cli/0.2.0-beta.3+auto-provenance-fusion-v1", "expected automatic fusion engine");
+  assert(json.score_input === null, "automatic score must not consume Harbor as a scoring signal");
+  assert(json.reports.lint.score_input === undefined, "lint report must omit score_input");
+  assert(json.reports.automatic_score.label_inputs_used === false, "automatic score must declare label-free inputs");
+  assert(!json.reports.automatic_score.llm_user_prompt.includes("manual_group"), "prompt must omit manual labels");
+  assert(!json.reports.automatic_score.llm_user_prompt.includes("fidelity_label"), "prompt must omit fidelity labels");
+  assert(json.components.llm_no_hack_score === 100, "continuous hack_risk must map to no-hack score");
+  assert(json.components.provenance_gate_score === 97.5, "provenance must combine no-hack and sufficiency");
+  const expected = (
+    json.components.rule_score
+    + json.components.provenance_gate_score
+    + json.components.llm_no_hack_score
+  ) / 3;
+  assert(Math.abs(json.score - expected) < 1e-6, "score must equal the simple three-layer mean");
+  return {
+    score: json.score,
+    components: json.components,
+    provenance_formula: json.reports.automatic_score.provenance_formula,
   };
 });
 

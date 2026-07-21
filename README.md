@@ -89,6 +89,39 @@ Run all deterministic gates:
 trace-score lint --trace ./trace.jsonl --score 86 --out trace-report.json
 ```
 
+Produce the unified label-free three-layer score. The command recomputes Rule
+from the trace, asks the LLM for continuous `hack_risk` and
+`provenance_sufficiency` using only trace/task evidence, derives an automatic
+Provenance score, and returns the arithmetic mean. It does not consume a
+Harbor/verifier score or manual audit metadata as a scoring signal.
+
+```bash
+trace-score score \
+  --trace ./trace.jsonl \
+  --task ./task.md \
+  --llm \
+  --out score.json
+```
+
+The component formulas are:
+
+```text
+Rule = freshly computed trace_quality_score
+LLM = 100 - hack_risk
+Provenance = (LLM + provenance_sufficiency) / 2
+Score = (Rule + Provenance + LLM) / 3
+```
+
+For deterministic regression testing only, replay a captured LLM response:
+
+```bash
+trace-score score \
+  --trace ./trace.jsonl \
+  --task ./task.md \
+  --llm-result ./stored-llm-result.json \
+  --out score.json
+```
+
 Classify structured tool-call schemas and verify a claimed provider family:
 
 ```bash

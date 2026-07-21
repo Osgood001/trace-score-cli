@@ -1,0 +1,18 @@
+{
+  "provider_response_id": "migration-replay-fixture",
+  "provider_model": "fixture",
+  "finish_reason": "stop",
+  "content_json": {
+    "hack_risk": 0,
+    "provenance_sufficiency": 95,
+    "decision": "likely_clean",
+    "verdict": "faithful",
+    "confidence": 1,
+    "hack_type": null,
+    "clean_for_sft": true,
+    "reward_adjustment": "keep",
+    "rationale": "Deterministic replay fixture.",
+    "evidence_events": [],
+    "recommended_action": "keep"
+  }
+}
